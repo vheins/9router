@@ -1,0 +1,37 @@
+# SearXNG settings for the bundled 9router web-search sidecar.
+#
+# Mounted read-only at /etc/searxng/settings.yml (the path the official
+# searxng/searxng image expects — see $__SEARXNG_SETTINGS_PATH in the image).
+#
+# `use_default_settings: true` inherits every engine, category and UI default
+# from the image's own settings.yml, so only the overrides below are declared.
+# This keeps the file tiny and avoids drifting from upstream defaults.
+#
+# Docs: https://docs.searxng.org/admin/settings/
+use_default_settings: true
+
+search:
+  # CRITICAL: the 9router provider calls SearXNG with `?format=json`
+  # (open-sse/handlers/search/callers.js -> buildSearxngRequest). Upstream
+  # SearXNG only enables `html` by default, so without this the request is
+  # rejected (HTTP 403 / "format not allowed"). `html` is kept so the web UI
+  # still works in a browser.
+  formats:
+    - html
+    - json
+
+server:
+  # The sidecar is internal-only and consumed by the 9router app over the
+  # Docker network, not by browsers. Disable the bot/rate limiter so local API
+  # calls are never throttled or blocked (a limiter would 403 the JSON calls).
+  limiter: false
+
+  # SearXNG requires a secret key to sign session state. The official image
+  # only auto-generates one when it creates settings.yml itself; because we
+  # mount our own file, we must supply a value here.
+  #
+  # This is a local-only, internal instance (no host port published), so the
+  # value is not a sensitive credential. It can be overridden at runtime with
+  # the SEARXNG_SECRET env var (wired in docker-compose.yml, and preferred by
+  # the image) — when that var is set it takes precedence over this line.
+  secret_key: "au3wChJMRnemqZaLwxtD0Pv5xufhYqJnlPkhTiXptpU"

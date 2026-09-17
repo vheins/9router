@@ -85,9 +85,9 @@ async function tryDedicatedProvider({ provider, providerConfig, body, credential
     providerSpecificData: credentials?.providerSpecificData
   };
 
-  let url, init;
+  let url, init, trusted;
   try {
-    ({ url, init } = buildSearchRequest({ id: provider.id, ...providerConfig }, params));
+    ({ url, init, trusted } = buildSearchRequest({ id: provider.id, ...providerConfig }, params));
   } catch (err) {
     return { success: false, status: 400, error: err?.message || `Invalid request for ${provider.id}` };
   }
@@ -101,7 +101,15 @@ async function tryDedicatedProvider({ provider, providerConfig, body, credential
   log?.info?.("SEARCH", `${provider.id} | "${params.query.slice(0, 80)}" | type=${params.searchType}`);
 
   try {
-    const resp = await fetchPublic(url, { ...init, headers: sanitizeHeaders(init.headers), signal: controller.signal });
+    // `trusted` is set by the builder ONLY when the URL derives purely from
+    // admin/env config (no client-supplied baseUrl override). It is derived
+    // from the presence of an override in the request params, never read from
+    // request input, so a client cannot flip it. Trusted (admin-configured,
+    // possibly internal — e.g. self-hosted SearXNG on a Docker host) URLs use
+    // plain fetch; client-controlled URLs stay on the SSRF-hardened fetchPublic.
+    const resp = trusted === true
+      ? await fetch(url, { ...init, headers: sanitizeHeaders(init.headers), signal: controller.signal })
+      : await fetchPublic(url, { ...init, headers: sanitizeHeaders(init.headers), signal: controller.signal });
     clearTimeout(timer);
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");

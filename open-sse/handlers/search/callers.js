@@ -69,11 +69,17 @@ export function getProviderSetting(params, key) {
  * The override is client-controlled and therefore SSRF-hardened: only public
  * http(s) URLs are accepted (internal/private/loopback/metadata addresses are
  * rejected via assertPublicUrl). The provider's own configured baseUrl is
- * trusted as-is (admin-controlled).
+ * trusted as-is (admin/env-controlled) and is NOT SSRF-checked here — an admin
+ * may legitimately point a self-hosted provider (e.g. SearXNG) at an internal
+ * Docker host such as http://searxng:8080/search.
+ *
+ * Returns `clientControlled` so callers can propagate whether the resolved URL
+ * came from client input. Only when it is `false` may the request bypass the
+ * SSRF-hardened fetch path in the search handler.
  *
  * @param {SearchProviderConfig} config
  * @param {SearchRequestParams} params
- * @returns {string}
+ * @returns {{baseUrl: string, clientControlled: boolean}}
  */
 export function resolveBaseUrl(config, params) {
   const override = getProviderSetting(params, "baseUrl");
@@ -90,7 +96,8 @@ export function resolveBaseUrl(config, params) {
     }
     assertPublicUrl(override);
   }
-  return (override || config.baseUrl).replace(/\/+$/, "");
+  const baseUrl = (override || config.baseUrl).replace(/\/+$/, "");
+  return { baseUrl, clientControlled: Boolean(override) };
 }
 
 /**
@@ -111,8 +118,10 @@ function buildSerperRequest(config, params) {
   const body = { q: params.query, num: params.maxResults };
   if (params.country) body.gl = params.country.toLowerCase();
   if (params.language) body.hl = params.language;
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   return {
-    url: `${resolveBaseUrl(config, params)}${endpoint}`,
+    url: `${baseUrl}${endpoint}`,
+    trusted: !clientControlled,
     init: {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-API-Key": params.token },
@@ -126,8 +135,10 @@ function buildBraveRequest(config, params) {
   const qp = new URLSearchParams({ q: params.query, count: String(params.maxResults) });
   if (params.country) qp.set("country", params.country);
   if (params.language) qp.set("search_lang", params.language);
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   return {
-    url: `${resolveBaseUrl(config, params)}${endpoint}?${qp}`,
+    url: `${baseUrl}${endpoint}?${qp}`,
+    trusted: !clientControlled,
     init: {
       method: "GET",
       headers: { Accept: "application/json", "X-Subscription-Token": params.token },
@@ -140,8 +151,10 @@ function buildPerplexityRequest(config, params) {
   if (params.country) body.country = params.country;
   if (params.language) body.search_language_filter = [params.language];
   if (params.domainFilter?.length) body.search_domain_filter = params.domainFilter;
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   return {
-    url: resolveBaseUrl(config, params),
+    url: baseUrl,
+    trusted: !clientControlled,
     init: {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${params.token}` },
@@ -162,8 +175,10 @@ function buildExaRequest(config, params) {
   if (includes.length) body.includeDomains = includes;
   if (excludes.length) body.excludeDomains = excludes;
   if (params.searchType === "news") body.category = "news";
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   return {
-    url: resolveBaseUrl(config, params),
+    url: baseUrl,
+    trusted: !clientControlled,
     init: {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": params.token },
@@ -182,8 +197,10 @@ function buildTavilyRequest(config, params) {
   if (includes.length) body.include_domains = includes;
   if (excludes.length) body.exclude_domains = excludes;
   if (params.country) body.country = params.country;
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   return {
-    url: resolveBaseUrl(config, params),
+    url: baseUrl,
+    trusted: !clientControlled,
     init: {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${params.token}` },
@@ -214,8 +231,10 @@ function buildGooglePseRequest(config, params) {
   if (typeof params.offset === "number" && params.offset > 0) {
     qp.set("start", String(Math.min(params.offset + 1, 91)));
   }
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   return {
-    url: `${resolveBaseUrl(config, params)}?${qp}`,
+    url: `${baseUrl}?${qp}`,
+    trusted: !clientControlled,
     init: {
       method: "GET",
       headers: { Accept: "application/json" },
@@ -254,8 +273,10 @@ function buildLinkupRequest(config, params) {
     body.toDate = toDate;
   }
 
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   return {
-    url: resolveBaseUrl(config, params),
+    url: baseUrl,
+    trusted: !clientControlled,
     init: {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
@@ -279,8 +300,10 @@ function buildSearchApiRequest(config, params) {
   const page = toPageNumber(params.offset, params.maxResults);
   if (page) qp.set("page", String(page));
 
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   return {
-    url: `${resolveBaseUrl(config, params)}?${qp}`,
+    url: `${baseUrl}?${qp}`,
+    trusted: !clientControlled,
     init: {
       method: "GET",
       headers: { Accept: "application/json" },
@@ -315,8 +338,10 @@ function buildYouComRequest(config, params) {
     );
   }
 
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   return {
-    url: `${resolveBaseUrl(config, params)}?${qp}`,
+    url: `${baseUrl}?${qp}`,
+    trusted: !clientControlled,
     init: {
       method: "GET",
       headers: { Accept: "application/json", "X-API-Key": apiKey },
@@ -325,7 +350,7 @@ function buildYouComRequest(config, params) {
 }
 
 function buildSearxngRequest(config, params) {
-  const baseUrl = resolveBaseUrl(config, params);
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   const url = baseUrl.endsWith("/search") ? baseUrl : `${baseUrl}/search`;
   const qp = new URLSearchParams({
     q: params.query,
@@ -340,6 +365,7 @@ function buildSearxngRequest(config, params) {
 
   return {
     url: `${url}?${qp}`,
+    trusted: !clientControlled,
     init: {
       method: "GET",
       headers: { Accept: "application/json" },
@@ -365,8 +391,10 @@ function buildXquikRequest(config, params) {
   if (queryType) qp.set("queryType", queryType);
   if (params.language) qp.set("language", params.language);
 
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   return {
-    url: `${resolveBaseUrl(config, params)}?${qp}`,
+    url: `${baseUrl}?${qp}`,
+    trusted: !clientControlled,
     init: {
       method: "GET",
       headers: { Accept: "application/json", "x-api-key": apiKey },
@@ -381,8 +409,10 @@ function buildOllamaSearchRequest(config, params) {
   const body = { query: params.query, max_results: params.maxResults };
   if (params.country) body.country = params.country;
   if (params.language) body.language = params.language;
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   return {
-    url: resolveBaseUrl(config, params),
+    url: baseUrl,
+    trusted: !clientControlled,
     init: {
       method: "POST",
       headers: {
@@ -409,8 +439,10 @@ function buildGlmSearchRequest(config, params) {
       arguments: { search_query: params.query, count: params.maxResults },
     },
   };
+  const { baseUrl, clientControlled } = resolveBaseUrl(config, params);
   return {
-    url: resolveBaseUrl(config, params),
+    url: baseUrl,
+    trusted: !clientControlled,
     init: {
       method: "POST",
       headers: {
@@ -445,14 +477,16 @@ const BUILDERS = {
  * Falls back to generic POST + bearer auth for unknown providers.
  * @param {SearchProviderConfig} provider
  * @param {SearchRequestParams} params
- * @returns {{url: string, init: RequestInit}}
+ * @returns {{url: string, init: RequestInit, trusted: boolean}}
  */
 export function buildSearchRequest(provider, params) {
   const builder = BUILDERS[provider.id];
   if (builder) return builder(provider, params);
 
+  const { baseUrl, clientControlled } = resolveBaseUrl(provider, params);
   return {
-    url: resolveBaseUrl(provider, params),
+    url: baseUrl,
+    trusted: !clientControlled,
     init: {
       method: provider.method || "POST",
       headers: {

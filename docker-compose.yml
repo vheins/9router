@@ -48,6 +48,10 @@ services:
       # Set to 1 to force a re-run of the one-time SQLite -> MariaDB copy.
       # Normally injected by `./start.sh migrate`.
       DB_MIGRATE_FORCE: ${DB_MIGRATE_FORCE:-0}
+      # Bundled SearXNG web-search sidecar (see the `searxng` service below).
+      # `searxng` resolves on 9router-net; override to point at a remote
+      # instance, e.g. SEARXNG_URL=https://searx.example.com/search.
+      SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080/search}
     networks:
       - 9router-net
     depends_on:
@@ -55,6 +59,9 @@ services:
         condition: service_started
         required: false
       mariadb:
+        condition: service_healthy
+        required: false
+      searxng:
         condition: service_healthy
         required: false
 
@@ -96,11 +103,53 @@ services:
     networks:
       - 9router-net
 
+  # Bundled SearXNG instance for the built-in web-search provider.
+  #
+  # Always-on (not profile-gated) so plain `docker compose up -d` yields working
+  # web search out of the box. It is internal-only: no host port is published,
+  # and the app reaches it by DNS name `searxng` on the shared 9router-net.
+  #
+  # The image defaults to listening on 8080 (GRANIAN_PORT), which is what the
+  # 9router provider expects via SEARXNG_URL.
+  searxng:
+    image: ${SEARXNG_IMAGE:-searxng/searxng:latest}
+    container_name: 9router-searxng
+    restart: always
+    environment:
+      # Session-signing key. The image honours SEARXNG_SECRET and it takes
+      # precedence over `server.secret_key` in settings.yml. Using `${VAR:-…}`
+      # (rather than `${VAR:-}`) keeps the generated default even when the var
+      # is set-but-empty, which would otherwise blank the key and break SearXNG.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-au3wChJMRnemqZaLwxtD0Pv5xufhYqJnlPkhTiXptpU}
+    volumes:
+      # Writable config/state dir (named volume, declared below).
+      - 9router-searxng-data:/etc/searxng
+      # Our minimal settings file overrides the image default. It enables the
+      # JSON output format the 9router provider requests (`?format=json`) and
+      # disables the rate limiter. Read-only: the container never edits it.
+      - ./docker/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    networks:
+      - 9router-net
+    healthcheck:
+      # Image ships wget; /healthz returns "OK" (verified against this tag).
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    # No host port published by default (internal-only). To debug from the host,
+    # uncomment the mapping below and browse http://localhost:8090 (8090 is the
+    # searxng port reserved in .env):
+    # ports:
+    #   - "8090:8080"
+
 volumes:
   9router-data:
     name: 9router-data
   9router-mariadb-data:
     name: 9router-mariadb-data
+  9router-searxng-data:
+    name: 9router-searxng-data
 
 networks:
   9router-net:

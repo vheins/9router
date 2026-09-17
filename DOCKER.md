@@ -105,10 +105,11 @@ docker run -d \
 
 ### Using Docker Compose
 
-The repo ships a `docker-compose.yml` that defines the app, an optional
-`headroom` sidecar, and a **profile-gated** MariaDB service. Plain
-`docker compose up` is SQLite-only (backward compatible); MariaDB is opt-in via
-the `mariadb` profile.
+The repo ships a `docker-compose.yml` that defines the app, a bundled
+`searxng` web-search sidecar, an optional `headroom` sidecar, and a
+**profile-gated** MariaDB service. Plain `docker compose up` brings up the app,
+SearXNG (working web search) and headroom; MariaDB is opt-in via the `mariadb`
+profile.
 
 > **The app service is built from local source.** `docker-compose.yml` uses
 > `image: 9router:local` with a `build: .` section, so `docker compose up -d
@@ -234,6 +235,77 @@ DB_MIGRATE_FORCE=1 docker compose --profile mariadb up -d --force-recreate 9rout
 
 (combined with removing the marker first, e.g.
 `docker run --rm -v 9router-data:/app/data alpine sh -c 'rm -f /app/data/db/.migrated-to-mariadb'`).
+
+## Bundled SearXNG web search
+
+9Router's built-in, unauthenticated **web-search provider** talks to a SearXNG
+instance. The Compose stack ships one as an **always-on** service, so web search
+works out of the box — no extra setup:
+
+```bash
+docker compose up -d          # brings up 9router + searxng + headroom
+```
+
+- Service `searxng`, container `9router-searxng`, image
+  `searxng/searxng:latest` (override with `SEARXNG_IMAGE`).
+- **Internal-only:** no host port is published; the app reaches it by DNS name
+  `searxng` on the shared `9router-net` network at `http://searxng:8080/search`.
+- The app service gets `SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080/search}`,
+  so it targets the sidecar by default but stays overridable (see below).
+- Config/state lives in the named volume `9router-searxng-data:/etc/searxng`.
+- A healthcheck (`wget -qO- http://127.0.0.1:8080/healthz`) marks it healthy; the
+  app declares `depends_on: searxng: { condition: service_healthy, required: false }`.
+
+### JSON format requirement
+
+The 9Router provider calls SearXNG with `?format=json`, but upstream SearXNG
+only enables `html` by default and rejects other formats (HTTP 403). The repo
+therefore mounts a minimal settings file, `docker/searxng/settings.yml`
+(read-only at `/etc/searxng/settings.yml`), which enables JSON and disables the
+rate limiter:
+
+```yaml
+use_default_settings: true
+search:
+  formats: [html, json]   # REQUIRED: 9router requests ?format=json
+server:
+  limiter: false          # local API calls must not be rate-limited
+  secret_key: "..."       # signing key (overridable via SEARXNG_SECRET)
+```
+
+**Any SearXNG instance you point `SEARXNG_URL` at must serve `format=json`.**
+For an external instance, add `json` to `search.formats` in its own settings and
+disable the limiter, or JSON requests will fail.
+
+### Pointing at a different SearXNG
+
+```bash
+# .env
+SEARXNG_URL=https://searx.example.com/search
+```
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SEARXNG_URL` | `http://searxng:8080/search` | Endpoint the app calls (must serve `?format=json`) |
+| `SEARXNG_IMAGE` | `searxng/searxng:latest` | Bundled SearXNG image |
+| `SEARXNG_SECRET` | *(generated)* | SearXNG session-signing key |
+
+### Disabling the bundled SearXNG
+
+The service is always-on; to run without it:
+
+```bash
+# Start only the app (and whatever else you name)
+docker compose up -d 9router
+
+# Or stop/remove just the sidecar
+docker compose stop searxng
+docker compose rm -f searxng
+```
+
+Web search will then be unavailable unless `SEARXNG_URL` points at another
+instance. To expose the bundled instance on the host for debugging only, add an
+optional port mapping (see the commented block in `docker-compose.yml`).
 
 ## Optional Headroom sidecar
 
