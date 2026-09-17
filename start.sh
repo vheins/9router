@@ -8,6 +8,7 @@
 #   ./start.sh restart      recreate the app container
 #   ./start.sh logs [svc]   tail logs (svc = 9router | 9router-mariadb)
 #   ./start.sh migrate      force a one-time SQLite -> MariaDB copy
+#   ./start.sh prune        drop dangling 9router images + build cache + idle network
 #   ./start.sh status       show container status
 #   ./start.sh help         this help
 #
@@ -16,6 +17,10 @@
 #   DB_MODE=mariadb -> MariaDB sidecar container + app container pointed at it.
 #                      On first boot with an existing SQLite file, the app
 #                      auto-migrates that data into MariaDB (one-time).
+#
+# Fast swap (near-zero downtime): the image is built BEFORE the running
+# container is replaced, so the only gap is the stop -> start swap (a few
+# seconds), not the whole build. `up` waits until the app accepts connections.
 set -euo pipefail
 
 # ─── Config (overridable via environment) ────────────────────────────────
@@ -74,6 +79,12 @@ DB_MODE="${DB_MODE:-sqlite}"
 DB_NAME="${DB_NAME:-9router}"
 DB_USER="${DB_USER:-9router}"
 
+DB_PORT="${DB_PORT:-3306}"
+MARIA_HOST_PORT="${MARIA_HOST_PORT:-$DB_PORT}"
+
+# When true, also prune BuildKit cache older than 7 days after each build.
+PRUNE_BUILD_CACHE="${PRUNE_BUILD_CACHE:-false}"
+
 # ─── Helpers ─────────────────────────────────────────────────────────────
 usage() {
   # Print the leading comment block (after the shebang, up to first non-comment).
@@ -111,6 +122,33 @@ stop_maria() {
   fi
 }
 
+# Remove the previously-tagged app image (now dangling) after a successful swap.
+remove_old_image() {
+  local old_id="${1:-}"
+  [ -n "$old_id" ] || return 0
+  local new_id
+  new_id="$(docker image inspect -f '{{.Id}}' "$APP_IMAGE" 2>/dev/null || true)"
+  if [ -n "$new_id" ] && [ "$old_id" = "$new_id" ]; then
+    return 0   # cache hit — same image, nothing to drop
+  fi
+  docker image rm "$old_id" >/dev/null 2>&1 || true
+}
+
+# Prune ONLY dangling images that belong to this project (label-scoped, safe).
+cleanup_dangling() {
+  docker image prune -f --filter "label=com.9router.managed=true" >/dev/null 2>&1 || true
+}
+
+# Remove the project network if no containers are attached to it.
+cleanup_network() {
+  docker network inspect "$NETWORK" >/dev/null 2>&1 || return 0
+  local attached
+  attached="$(docker network inspect -f '{{len .Containers}}' "$NETWORK" 2>/dev/null || echo 0)"
+  if [ "$attached" = "0" ]; then
+    docker network rm "$NETWORK" >/dev/null 2>&1 || true
+  fi
+}
+
 # Persist DB_PASSWORD to .env if missing, so it is stable across runs.
 ensure_db_password() {
   if [ -n "${DB_PASSWORD:-}" ]; then return 0; fi
@@ -135,7 +173,7 @@ ensure_db_password() {
 wait_for_maria() {
   local tries=0 max=60
   log "Waiting for MariaDB to be ready..."
-  until docker exec "$MARIA_CONTAINER" mariadb-admin ping -h 127.0.0.1 -u root -p"${DB_ROOT_PASSWORD}" >/dev/null 2>&1; do
+  until docker exec "$MARIA_CONTAINER" mariadb-admin ping -h 127.0.0.1 -P "${DB_PORT}" -u root -p"${DB_ROOT_PASSWORD}" >/dev/null 2>&1; do
     tries=$((tries + 1))
     if [ "$tries" -ge "$max" ]; then
       die "MariaDB did not become ready in time (${max} attempts). Check: docker logs $MARIA_CONTAINER"
@@ -147,15 +185,41 @@ wait_for_maria() {
   log "MariaDB is ready."
 }
 
+# Poll the published app port until it accepts connections (or timeout).
+# Uses bash's built-in /dev/tcp so it needs no host curl/wget.
+wait_for_app() {
+  local tries=0 max=60
+  log "Waiting for app to be ready on port ${APP_PORT}..."
+  until (echo >"/dev/tcp/127.0.0.1/${APP_PORT}") 2>/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge "$max" ]; then
+      warn "App did not accept connections within $((max * 2))s — check: docker logs $APP_NAME"
+      return 0
+    fi
+    printf '.'
+    sleep 2
+  done
+  printf '\n'
+  log "App is ready."
+}
+
 # ─── Modes ───────────────────────────────────────────────────────────────
 run_sqlite() {
   log "Mode: sqlite"
   # Clean up any MariaDB sidecar so switching back to sqlite is clean.
   stop_maria
 
-  stop_app
+  # Remember the current image so we can drop it after a successful swap
+  # (re-tagging below would otherwise leave it behind as <none>:<none>).
+  local old_image_id
+  old_image_id="$(docker image inspect -f '{{.Id}}' "$APP_IMAGE" 2>/dev/null || true)"
+
+  # Build the new image FIRST while the current container keeps serving,
+  # so the only gap is the stop -> start swap (a few seconds), not the build.
   log "Building image: $APP_IMAGE"
-  docker build -t "$APP_IMAGE" .
+  docker build -t "$APP_IMAGE" --label com.9router.managed=true .
+
+  stop_app
   log "Starting app container (sqlite) on port $APP_PORT"
   docker run -d --name "$APP_NAME" \
     -p "${APP_PORT}:20128" \
@@ -163,6 +227,12 @@ run_sqlite() {
     -e DB_MODE=sqlite \
     -v "${APP_DATA_VOLUME}:/app/data" \
     "$APP_IMAGE" >/dev/null
+  wait_for_app
+  remove_old_image "$old_image_id"
+  cleanup_dangling
+  if [ "${PRUNE_BUILD_CACHE:-false}" = "true" ]; then
+    docker builder prune -f --filter "until=168h" >/dev/null 2>&1 || true
+  fi
   log "Up. App: http://localhost:${APP_PORT}"
 }
 
@@ -185,12 +255,14 @@ run_mariadb() {
       log "Creating MariaDB container: $MARIA_CONTAINER"
       docker run -d --name "$MARIA_CONTAINER" \
         --network "$NETWORK" \
+        -p "${MARIA_HOST_PORT}:${DB_PORT}" \
         -v "${MARIA_VOLUME}:/var/lib/mysql" \
         -e MARIADB_ROOT_PASSWORD="$DB_ROOT_PASSWORD" \
         -e MARIADB_DATABASE="$DB_NAME" \
         -e MARIADB_USER="$DB_USER" \
         -e MARIADB_PASSWORD="$DB_PASSWORD" \
         "$MARIA_IMAGE" \
+        --port="${DB_PORT}" \
         --character-set-server=utf8mb4 \
         --collation-server=utf8mb4_unicode_ci >/dev/null
     fi
@@ -198,10 +270,16 @@ run_mariadb() {
 
   wait_for_maria
 
-  stop_app
-  log "Building image: $APP_IMAGE"
-  docker build -t "$APP_IMAGE" .
+  # Remember the current image so we can drop it after a successful swap.
+  local old_image_id
+  old_image_id="$(docker image inspect -f '{{.Id}}' "$APP_IMAGE" 2>/dev/null || true)"
 
+  # Build the new image FIRST while the current container keeps serving,
+  # so the only gap is the stop -> start swap (a few seconds), not the build.
+  log "Building image: $APP_IMAGE"
+  docker build -t "$APP_IMAGE" --label com.9router.managed=true .
+
+  stop_app
   log "Starting app container (mariadb) on port $APP_PORT"
   docker run -d --name "$APP_NAME" \
     --network "$NETWORK" \
@@ -209,15 +287,21 @@ run_mariadb() {
     --env-file "$ENV_FILE" \
     -e DB_MODE=mariadb \
     -e DB_HOST="$MARIA_CONTAINER" \
-    -e DB_PORT=3306 \
+    -e DB_PORT="$DB_PORT" \
     -e DB_USER="$DB_USER" \
     -e DB_PASSWORD="$DB_PASSWORD" \
     -e DB_NAME="$DB_NAME" \
     -v "${APP_DATA_VOLUME}:/app/data" \
     "$APP_IMAGE" >/dev/null
 
+  wait_for_app
+  remove_old_image "$old_image_id"
+  cleanup_dangling
+  if [ "${PRUNE_BUILD_CACHE:-false}" = "true" ]; then
+    docker builder prune -f --filter "until=168h" >/dev/null 2>&1 || true
+  fi
   log "Up. App: http://localhost:${APP_PORT}"
-  log "MariaDB: host=${MARIA_CONTAINER} port=3306 db=${DB_NAME} user=${DB_USER}"
+  log "MariaDB: host=${MARIA_CONTAINER} port=${DB_PORT} db=${DB_NAME} user=${DB_USER}"
   log "Note: an existing SQLite file (if any) is auto-migrated into MariaDB on first boot."
 }
 
@@ -240,13 +324,14 @@ force_migrate() {
     --env-file "$ENV_FILE" \
     -e DB_MODE=mariadb \
     -e DB_HOST="$MARIA_CONTAINER" \
-    -e DB_PORT=3306 \
+    -e DB_PORT="$DB_PORT" \
     -e DB_USER="$DB_USER" \
     -e DB_PASSWORD="$DB_PASSWORD" \
     -e DB_NAME="$DB_NAME" \
     -e DB_MIGRATE_FORCE=1 \
     -v "${APP_DATA_VOLUME}:/app/data" \
     "$APP_IMAGE" >/dev/null
+  wait_for_app
   log "Restarted app; migration will run on boot."
 }
 
@@ -255,6 +340,7 @@ do_down() {
   [ "${1:-}" = "--volumes" ] && purge=1
   stop_app
   stop_maria
+  cleanup_network
   if [ "$purge" -eq 1 ]; then
     warn "Removing named volumes (${APP_DATA_VOLUME}, ${MARIA_VOLUME}) — DATA WILL BE LOST"
     docker volume rm "$APP_DATA_VOLUME" "$MARIA_VOLUME" >/dev/null 2>&1 || true
@@ -270,6 +356,15 @@ do_logs() {
 do_status() {
   docker ps -a --filter "name=${APP_NAME}" --filter "name=${MARIA_CONTAINER}" \
     --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+}
+
+do_prune() {
+  log "Removing dangling 9router images..."
+  cleanup_dangling
+  warn "docker builder prune clears BuildKit cache for ALL projects on this host (next builds may be slower)."
+  docker builder prune -f >/dev/null 2>&1 || true
+  cleanup_network
+  log "Pruned."
 }
 
 # ─── Main ────────────────────────────────────────────────────────────────
@@ -306,6 +401,7 @@ main() {
       ;;
     logs)      do_logs "${1:-}" ;;
     migrate)   force_migrate ;;
+    prune)     do_prune ;;
     status)    do_status ;;
     *)         die "Unknown command: $cmd (try './start.sh help')" ;;
   esac
