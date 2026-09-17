@@ -4,7 +4,7 @@ import path from "node:path";
 import { ensureDirs, DATA_FILE } from "./paths.js";
 
 // Use global to survive Next.js dev hot-reload (module state resets on reload)
-if (!global._dbAdapter) global._dbAdapter = { instance: null, initPromise: null, logged: false, driver: null };
+if (!global._dbAdapter) global._dbAdapter = { instance: null, initPromise: null, logged: false, blockingWarned: false, driver: null };
 const state = global._dbAdapter;
 
 // ─── DB mode ──────────────────────────────────────────────────────────────
@@ -148,7 +148,9 @@ function mariaConfigFromEnv() {
     user: process.env.DB_USER || "9router",
     password: process.env.DB_PASSWORD || "",
     database: process.env.DB_NAME || "9router",
-    connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 10),
+    // Default 20 (was 10): MariaDB's default max_connections is 151, so 20 gives
+    // safe headroom for concurrent SSE streams without exhausting the server.
+    connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 20),
   };
 }
 
@@ -179,6 +181,17 @@ async function initAdapter() {
     if (!state.logged) {
       console.log(`[DB] Driver: ${adapter.driver} | file: ${DATA_FILE}`);
       state.logged = true;
+    }
+    // One-time, non-fatal heads-up: every SQLite driver in the fallback chain is
+    // synchronous, so under concurrency (e.g. concurrent SSE streams) it blocks
+    // the event loop. Only warn in production; never in dev/test.
+    if (process.env.NODE_ENV === "production" && !state.blockingWarned) {
+      console.warn(
+        `[DB] WARNING: SQLite driver "${adapter.driver}" is synchronous and blocks the event loop under concurrency. ` +
+          "All SQLite drivers (better-sqlite3 / node:sqlite / bun:sqlite / sql.js) are synchronous; " +
+          "for concurrent production workloads set DB_MODE=mariadb."
+      );
+      state.blockingWarned = true;
     }
   }
 

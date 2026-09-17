@@ -44,7 +44,9 @@ services:
       DB_USER: ${DB_USER:-9router}
       DB_PASSWORD: ${DB_PASSWORD:-}
       DB_NAME: ${DB_NAME:-9router}
-      DB_CONNECTION_LIMIT: ${DB_CONNECTION_LIMIT:-10}
+      # Pool size. MariaDB's default max_connections is 151, so 20 leaves safe
+      # headroom for concurrent SSE streams without exhausting the server.
+      DB_CONNECTION_LIMIT: ${DB_CONNECTION_LIMIT:-20}
       # Set to 1 to force a re-run of the one-time SQLite -> MariaDB copy.
       # Normally injected by `./start.sh migrate`.
       DB_MIGRATE_FORCE: ${DB_MIGRATE_FORCE:-0}

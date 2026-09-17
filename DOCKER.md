@@ -101,7 +101,7 @@ docker run -d \
 | `DB_USER` | `9router` | MariaDB user |
 | `DB_PASSWORD` | *(empty)* | MariaDB password |
 | `DB_NAME` | `9router` | MariaDB database name |
-| `DB_CONNECTION_LIMIT` | `10` | Connection pool size |
+| `DB_CONNECTION_LIMIT` | `20` | Connection pool size (MariaDB default `max_connections` is 151) |
 
 ### Using Docker Compose
 
@@ -342,6 +342,41 @@ docker pull decolua/9router:latest
 docker rm -f 9router
 # re-run the quick start command
 ```
+
+## Production performance tuning
+
+A few settings matter under concurrent production traffic (e.g. many SSE
+streams in flight). The defaults are safe; the notes below explain what to
+avoid turning on.
+
+### `DB_CONNECTION_LIMIT` (default `20`)
+
+MariaDB's server-side `max_connections` defaults to **151**, so a pool of `20`
+gives safe headroom for concurrent SSE streams without exhausting the server.
+The previous default of `10` was conservative — raise it only if you also raise
+the server's `max_connections`.
+
+### Keep `ENABLE_REQUEST_LOGS=false` (default)
+
+When set to `true`, the SSE engine appends **every streamed chunk** with a
+synchronous `fs.appendFileSync`. That blocks the Node.js event loop on each
+chunk, which is especially damaging under load. Leave it `false` in production;
+enable only for short, targeted debugging.
+
+### Keep `enableObservability=false` (default) under high traffic
+
+The observability setting (UI: `enableObservability`, default `false`) captures
+request details and adds a per-request `JSON.stringify` plus batched DB writes.
+That extra work is fine at low volume but adds CPU and write pressure under high
+traffic — keep it `false` when throughput matters.
+
+### SQLite in production: prefer `DB_MODE=mariadb`
+
+All SQLite drivers in the fallback chain (`better-sqlite3`, `node:sqlite`,
+`bun:sqlite`, `sql.js`) are **synchronous** and block the event loop under
+concurrency. If you run SQLite with `NODE_ENV=production`, the app logs a
+one-time warning on boot recommending `DB_MODE=mariadb`. For concurrent
+production workloads, use MariaDB.
 
 ---
 

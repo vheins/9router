@@ -66,7 +66,9 @@ export async function createMariaDbAdapter(config = {}) {
     user: config.user || "9router",
     password: config.password || "",
     database: config.database || "9router",
-    connectionLimit: Number(config.connectionLimit || 10),
+    // Default 20 (was 10): MariaDB's default max_connections is 151, so 20 gives
+    // safe headroom for concurrent SSE streams without exhausting the server.
+    connectionLimit: Number(config.connectionLimit || 20),
     // Return DATE/DATETIME/TIMESTAMP as strings (we store TEXT ISO strings anyway).
     dateStrings: true,
     // Keep DECIMAL as strings so cost values don't lose precision.
