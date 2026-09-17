@@ -10,11 +10,13 @@ async function loadSql() {
   return SQL;
 }
 
-export async function createSqlJsAdapter(filePath) {
+export async function createSqlJsAdapter(filePath, { readonly = false } = {}) {
   const SQLLib = await loadSql();
   const buf = fs.existsSync(filePath) ? fs.readFileSync(filePath) : null;
   const db = new SQLLib.Database(buf);
-  db.exec(PRAGMA_SQL);
+  // Read-only opens (migration source) must never mutate the file: skip the
+  // mutating PRAGMA_SQL (journal_mode=WAL etc.) entirely.
+  if (!readonly) db.exec(PRAGMA_SQL);
   // Schema is created/synced by migrate.js after adapter init
 
   let dirty = false;
@@ -28,6 +30,9 @@ export async function createSqlJsAdapter(filePath) {
   }
 
   function scheduleSave() {
+    // sql.js holds the DB in memory; the file is only rewritten on persist().
+    // Read-only opens never write back, so a read is inherently non-mutating.
+    if (readonly) return;
     dirty = true;
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
@@ -43,7 +48,7 @@ export async function createSqlJsAdapter(filePath) {
     return params;
   }
 
-  function run(sql, params = []) {
+  async function run(sql, params = []) {
     const stmt = db.prepare(sql);
     try {
       stmt.bind(paramsObj(params));
@@ -57,7 +62,7 @@ export async function createSqlJsAdapter(filePath) {
     }
   }
 
-  function get(sql, params = []) {
+  async function get(sql, params = []) {
     const stmt = db.prepare(sql);
     try {
       stmt.bind(paramsObj(params));
@@ -68,7 +73,7 @@ export async function createSqlJsAdapter(filePath) {
     }
   }
 
-  function all(sql, params = []) {
+  async function all(sql, params = []) {
     const stmt = db.prepare(sql);
     try {
       stmt.bind(paramsObj(params));
@@ -80,16 +85,16 @@ export async function createSqlJsAdapter(filePath) {
     }
   }
 
-  function exec(sql) {
+  async function exec(sql) {
     db.exec(sql);
     scheduleSave();
   }
 
-  function transaction(fn) {
+  async function transaction(fn) {
     const sp = `sp_${Math.random().toString(36).slice(2)}`;
     db.exec(`SAVEPOINT ${sp}`);
     try {
-      const result = fn();
+      const result = await fn();
       db.exec(`RELEASE ${sp}`);
       scheduleSave();
       return result;
@@ -99,17 +104,20 @@ export async function createSqlJsAdapter(filePath) {
     }
   }
 
-  function close() {
+  async function close() {
     if (saveTimer) clearTimeout(saveTimer);
-    if (dirty) persist();
+    // Read-only opens never persist — closing is safe and non-mutating.
+    if (!readonly && dirty) persist();
     db.close();
   }
 
-  // Flush on shutdown
-  const flush = () => { if (dirty) try { persist(); } catch {} };
-  process.on("beforeExit", flush);
-  process.on("SIGINT", flush);
-  process.on("SIGTERM", flush);
+  // Flush on shutdown. Read-only opens must not hijack process shutdown.
+  if (!readonly) {
+    const flush = () => { if (dirty) try { persist(); } catch {} };
+    process.on("beforeExit", flush);
+    process.on("SIGINT", flush);
+    process.on("SIGTERM", flush);
+  }
 
   return { driver: "sql.js", run, get, all, exec, transaction, close, raw: db };
 }

@@ -3,6 +3,8 @@
 // pre-change safety backup in migrate.js: when the stored version is lower,
 // one lightweight DB backup is taken before applying schema changes. Forgetting
 // to bump only skips that backup — it does NOT break the additive auto-sync.
+import { buildCreateTableMaria } from "./dialect.js";
+
 export const SCHEMA_VERSION = 1;
 
 export const PRAGMA_SQL = `
@@ -154,7 +156,8 @@ export const TABLES = {
   },
 };
 
-export function buildCreateTableSql(name, def) {
+export function buildCreateTableSql(name, def, mode = "sqlite") {
+  if (mode === "mariadb") return buildCreateTableMaria(name, def);
   const cols = Object.entries(def.columns).map(([k, v]) => `${k} ${v}`);
   if (def.primaryKey) cols.push(def.primaryKey);
   return `CREATE TABLE IF NOT EXISTS ${name} (${cols.join(", ")})`;

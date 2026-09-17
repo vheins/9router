@@ -2,21 +2,22 @@ import { getAdapter } from "../driver.js";
 
 export async function getMeta(key, fallback = null) {
   const db = await getAdapter();
-  const row = db.get(`SELECT value FROM _meta WHERE key = ?`, [key]);
+  const row = await db.get(`SELECT value FROM _meta WHERE key = ?`, [key]);
   return row ? row.value : fallback;
 }
 
 export async function setMeta(key, value) {
   const db = await getAdapter();
-  db.run(`INSERT INTO _meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [key, String(value)]);
+  await db.run(`INSERT INTO _meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [key, String(value)]);
 }
 
-// Sync versions for use during migration (adapter passed directly)
-export function getMetaSync(adapter, key, fallback = null) {
-  const row = adapter.get(`SELECT value FROM _meta WHERE key = ?`, [key]);
+// Adapter-scoped versions used during migration (adapter passed directly).
+// Async because every adapter (SQLite + MariaDB) now exposes an async interface.
+export async function getMetaFor(adapter, key, fallback = null) {
+  const row = await adapter.get(`SELECT value FROM _meta WHERE key = ?`, [key]);
   return row ? row.value : fallback;
 }
 
-export function setMetaSync(adapter, key, value) {
-  adapter.run(`INSERT INTO _meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [key, String(value)]);
+export async function setMetaFor(adapter, key, value) {
+  await adapter.run(`INSERT INTO _meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [key, String(value)]);
 }

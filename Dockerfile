@@ -43,6 +43,12 @@ COPY --from=builder /app/node_modules/next ./node_modules/next
 COPY --from=builder /app/node_modules/sql.js ./node_modules/sql.js
 # node-machine-id is createRequire-loaded at runtime; tracing omits it.
 COPY --from=builder /app/node_modules/node-machine-id ./node_modules/node-machine-id
+# MariaDB driver is loaded via dynamic import (DB_MODE=mariadb); tracing may omit
+# it and its runtime deps when the SQLite path is the default.
+COPY --from=builder /app/node_modules/mariadb ./node_modules/mariadb
+COPY --from=builder /app/node_modules/denque ./node_modules/denque
+COPY --from=builder /app/node_modules/iconv-lite ./node_modules/iconv-lite
+COPY --from=builder /app/node_modules/lru-cache ./node_modules/lru-cache
 
 RUN mkdir -p /app/data && chown -R node:node /app && \
   mkdir -p /app/data-home && chown node:node /app/data-home && \
