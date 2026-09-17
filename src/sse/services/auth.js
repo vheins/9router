@@ -6,8 +6,12 @@ import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
 import * as log from "../utils/logger.js";
 
-// Mutex to prevent race conditions during account selection
-let selectionMutex = Promise.resolve();
+// Per-provider mutexes to prevent race conditions during account selection.
+// The critical section below only read-modify-writes per-provider, per-connection
+// state (consecutiveUseCount / lastUsedAt) and per-provider proxy-pool rotation
+// state, so serializing by resolved provider id preserves correctness while
+// removing the cross-provider contention a single global mutex imposed.
+const selectionMutexes = new Map(); // providerId -> Promise
 
 const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
 
@@ -31,16 +35,22 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     ? excludeConnectionIds
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
-  // Acquire mutex to prevent race conditions
-  const currentMutex = selectionMutex;
+
+  // Resolve alias to provider ID (e.g., "kc" -> "kilocode") BEFORE acquiring the
+  // lock so the mutex can be keyed per provider. resolveProviderId is pure.
+  const providerId = resolveProviderId(provider);
+
+  // Acquire the per-provider mutex (race-free: get/set are synchronous with no
+  // await between them). The no-auth path below intentionally stays inside the
+  // lock: pickProxyPoolId keeps module-level per-provider round-robin state
+  // (connectionProxy.rotateState), so it must not run concurrently for one provider.
+  const currentMutex = selectionMutexes.get(providerId) ?? Promise.resolve();
   let resolveMutex;
-  selectionMutex = new Promise(resolve => { resolveMutex = resolve; });
+  const myLock = new Promise(resolve => { resolveMutex = resolve; });
+  selectionMutexes.set(providerId, myLock);
 
   try {
     await currentMutex;
-
-    // Resolve alias to provider ID (e.g., "kc" -> "kilocode")
-    const providerId = resolveProviderId(provider);
 
     // Inject a virtual connection for no-auth free providers (with optional proxy pool from settings)
     if (FREE_PROVIDERS[providerId]?.noAuth) {
@@ -222,7 +232,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       _connection: connection
     };
   } finally {
-    if (resolveMutex) resolveMutex();
+    resolveMutex();
+    // Clean up only if no newer waiter has chained onto our lock; otherwise the
+    // entry now points to their promise and must be left intact. Prevents
+    // unbounded Map growth without dropping a newer waiter's chain.
+    if (selectionMutexes.get(providerId) === myLock) selectionMutexes.delete(providerId);
   }
 }
 
