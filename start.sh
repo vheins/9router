@@ -1,30 +1,50 @@
 #!/usr/bin/env bash
-# 9router launcher — supports SQLite (default) and MariaDB modes.
+# 9router launcher — thin wrapper around docker compose.
+# Supports SQLite (default) and MariaDB modes via the compose `mariadb` profile.
 #
-#   ./start.sh              build + run (mode from DB_MODE in .env, default sqlite)
+#   ./start.sh              build the local image, then start the stack
+#                           (mode from DB_MODE in .env, default sqlite)
 #   ./start.sh up           same as above
-#   ./start.sh down         stop + remove app (and MariaDB sidecar)
+#   ./start.sh build        build the local app image (9router:local) only
+#   ./start.sh down         stop + remove containers (keeps named volumes)
 #   ./start.sh down --volumes   also remove named volumes (DESTRUCTIVE)
-#   ./start.sh restart      recreate the app container
-#   ./start.sh logs [svc]   tail logs (svc = 9router | 9router-mariadb)
+#   ./start.sh restart      restart the app container
+#   ./start.sh logs [svc]   tail logs (svc = 9router | mariadb | headroom; default 9router)
 #   ./start.sh migrate      force a one-time SQLite -> MariaDB copy
-#   ./start.sh prune        drop dangling 9router images + build cache + idle network
-#   ./start.sh status       show container status
+#   ./start.sh prune        drop dangling images + build cache
+#   ./start.sh status       show compose service status
 #   ./start.sh help         this help
 #
+# Image: the app service is BUILT FROM LOCAL SOURCE as image `9router:local`
+# (docker-compose.yml `build:` section) rather than pulled from Docker Hub. The
+# published `decolua/9router:latest` can lag behind the repo (it predates
+# MariaDB support), so `up` always builds first and never runs a stale image.
+#
 # Dual-mode behaviour:
-#   DB_MODE=sqlite  -> app container with a local SQLite file (named volume 9router-data)
-#   DB_MODE=mariadb -> MariaDB sidecar container + app container pointed at it.
-#                      On first boot with an existing SQLite file, the app
+#   DB_MODE=sqlite  -> app container only, backed by the 9router-data volume.
+#   DB_MODE=mariadb -> adds the profile-gated `mariadb` service (mariadb:11
+#                      sidecar, 9router-mariadb-data volume) and points the app
+#                      at it. On first boot with an existing SQLite file, the app
 #                      auto-migrates that data into MariaDB (one-time).
 #
-# Fast swap (near-zero downtime): the image is built BEFORE the running
-# container is replaced, so the only gap is the stop -> start swap (a few
-# seconds), not the whole build. `up` waits until the app accepts connections.
+# Fast swap: `up` builds the new image BEFORE the running container is
+# recreated, so the only gap is the stop -> start swap (a few seconds), not the
+# whole build.
+#
+# This script is a thin wrapper: all container provisioning lives in
+# docker-compose.yml. The equivalent raw commands are:
+#   sqlite  : docker compose build 9router && docker compose up -d
+#   mariadb : docker compose build 9router && docker compose --profile mariadb up -d
 set -euo pipefail
 
 # ─── Config (overridable via environment) ────────────────────────────────
 ENV_FILE="${ENV_FILE:-.env}"
+APP_SERVICE="${APP_SERVICE:-9router}"
+APP_IMAGE="${APP_IMAGE:-9router:local}"
+MARIA_SERVICE="${MARIA_SERVICE:-mariadb}"
+MARIA_CONTAINER="${MARIA_CONTAINER:-9router-mariadb}"
+APP_DATA_VOLUME="${APP_DATA_VOLUME:-9router-data}"
+MARIA_VOLUME="${MARIA_VOLUME:-9router-mariadb-data}"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
 log()  { printf '\033[1;36m[9router]\033[0m %s\n' "$*"; }
@@ -64,26 +84,10 @@ load_env() {
 
 load_env
 
-# ─── Config defaults (env / .env values win) ─────────────────────────────
-APP_NAME="${APP_NAME:-9router}"
-APP_IMAGE="${APP_IMAGE:-9router}"
-APP_PORT="${PORT:-20128}"
-APP_DATA_VOLUME="${APP_DATA_VOLUME:-9router-data}"
-
-MARIA_IMAGE="${MARIA_IMAGE:-mariadb:11}"
-MARIA_CONTAINER="${MARIA_CONTAINER:-9router-mariadb}"
-MARIA_VOLUME="${MARIA_VOLUME:-9router-mariadb-data}"
-NETWORK="${NETWORK:-9router-net}"
-
 DB_MODE="${DB_MODE:-sqlite}"
-DB_NAME="${DB_NAME:-9router}"
-DB_USER="${DB_USER:-9router}"
 
-DB_PORT="${DB_PORT:-3306}"
-MARIA_HOST_PORT="${MARIA_HOST_PORT:-$DB_PORT}"
-
-# When true, also prune BuildKit cache older than 7 days after each build.
-PRUNE_BUILD_CACHE="${PRUNE_BUILD_CACHE:-false}"
+# Global: compose profile flags for the current DB_MODE (populated by profile_args).
+PROFILE_ARGS=()
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
 usage() {
@@ -94,63 +98,29 @@ usage() {
 require_docker() {
   command -v docker >/dev/null 2>&1 || die "docker is not installed or not on PATH."
   docker info >/dev/null 2>&1 || die "docker daemon is not reachable (is it running?)."
+  docker compose version >/dev/null 2>&1 || die "docker compose (v2) is not available."
 }
 
-container_exists() { docker ps -a --format '{{.Names}}' | grep -qx "$1"; }
-container_running() { docker ps --format '{{.Names}}' | grep -qx "$1"; }
-
-ensure_network() {
-  if ! docker network inspect "$NETWORK" >/dev/null 2>&1; then
-    log "Creating docker network: $NETWORK"
-    docker network create "$NETWORK" >/dev/null
-  fi
+is_mariadb() {
+  case "${DB_MODE,,}" in
+    mariadb|mysql) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
-stop_app() {
-  if container_exists "$APP_NAME"; then
-    log "Stopping app container: $APP_NAME"
-    docker stop "$APP_NAME" >/dev/null 2>&1 || true
-    docker rm "$APP_NAME" >/dev/null 2>&1 || true
-  fi
-}
-
-stop_maria() {
-  if container_exists "$MARIA_CONTAINER"; then
-    log "Stopping MariaDB container: $MARIA_CONTAINER"
-    docker stop "$MARIA_CONTAINER" >/dev/null 2>&1 || true
-    docker rm "$MARIA_CONTAINER" >/dev/null 2>&1 || true
-  fi
-}
-
-# Remove the previously-tagged app image (now dangling) after a successful swap.
-remove_old_image() {
-  local old_id="${1:-}"
-  [ -n "$old_id" ] || return 0
-  local new_id
-  new_id="$(docker image inspect -f '{{.Id}}' "$APP_IMAGE" 2>/dev/null || true)"
-  if [ -n "$new_id" ] && [ "$old_id" = "$new_id" ]; then
-    return 0   # cache hit — same image, nothing to drop
-  fi
-  docker image rm "$old_id" >/dev/null 2>&1 || true
-}
-
-# Prune ONLY dangling images that belong to this project (label-scoped, safe).
-cleanup_dangling() {
-  docker image prune -f --filter "label=com.9router.managed=true" >/dev/null 2>&1 || true
-}
-
-# Remove the project network if no containers are attached to it.
-cleanup_network() {
-  docker network inspect "$NETWORK" >/dev/null 2>&1 || return 0
-  local attached
-  attached="$(docker network inspect -f '{{len .Containers}}' "$NETWORK" 2>/dev/null || echo 0)"
-  if [ "$attached" = "0" ]; then
-    docker network rm "$NETWORK" >/dev/null 2>&1 || true
+# Populate PROFILE_ARGS with the compose profile flag for the MariaDB service.
+# Sets a global array; empty when DB_MODE is sqlite.
+profile_args() {
+  PROFILE_ARGS=()
+  if is_mariadb; then
+    PROFILE_ARGS=(--profile "$MARIA_SERVICE")
   fi
 }
 
 # Persist DB_PASSWORD to .env if missing, so it is stable across runs.
+# Only relevant in MariaDB mode.
 ensure_db_password() {
+  is_mariadb || return 0
   if [ -n "${DB_PASSWORD:-}" ]; then return 0; fi
   # try to read a previously-generated value from .env
   if [ -f "$ENV_FILE" ] && grep -qE '^DB_PASSWORD=' "$ENV_FILE"; then
@@ -169,201 +139,106 @@ ensure_db_password() {
   export DB_PASSWORD
 }
 
-# Wait until the MariaDB sidecar accepts connections.
-wait_for_maria() {
-  local tries=0 max=60
-  log "Waiting for MariaDB to be ready..."
-  until docker exec "$MARIA_CONTAINER" mariadb-admin ping -h 127.0.0.1 -P "${DB_PORT}" -u root -p"${DB_ROOT_PASSWORD}" >/dev/null 2>&1; do
-    tries=$((tries + 1))
-    if [ "$tries" -ge "$max" ]; then
-      die "MariaDB did not become ready in time (${max} attempts). Check: docker logs $MARIA_CONTAINER"
-    fi
-    printf '.'
-    sleep 2
-  done
-  printf '\n'
-  log "MariaDB is ready."
+# Map legacy container-name arguments to compose service names (backward compat).
+normalize_service() {
+  case "${1:-}" in
+    "$MARIA_CONTAINER"|9router-mariadb) printf '%s' "$MARIA_SERVICE" ;;
+    "") printf '%s' "$APP_SERVICE" ;;
+    *) printf '%s' "$1" ;;
+  esac
 }
 
-# Poll the published app port until it accepts connections (or timeout).
-# Uses bash's built-in /dev/tcp so it needs no host curl/wget.
-wait_for_app() {
-  local tries=0 max=60
-  log "Waiting for app to be ready on port ${APP_PORT}..."
-  until (echo >"/dev/tcp/127.0.0.1/${APP_PORT}") 2>/dev/null; do
-    tries=$((tries + 1))
-    if [ "$tries" -ge "$max" ]; then
-      warn "App did not accept connections within $((max * 2))s — check: docker logs $APP_NAME"
-      return 0
-    fi
-    printf '.'
-    sleep 2
-  done
-  printf '\n'
-  log "App is ready."
+# ─── Commands ────────────────────────────────────────────────────────────
+# Build the local app image (9router:local) from the current source.
+do_build() {
+  log "Building local image: ${APP_IMAGE:-9router:local} (from local source)"
+  docker compose build "$APP_SERVICE"
+  log "Build complete."
 }
 
-# ─── Modes ───────────────────────────────────────────────────────────────
-run_sqlite() {
-  log "Mode: sqlite"
-  # Clean up any MariaDB sidecar so switching back to sqlite is clean.
-  stop_maria
-
-  # Remember the current image so we can drop it after a successful swap
-  # (re-tagging below would otherwise leave it behind as <none>:<none>).
-  local old_image_id
-  old_image_id="$(docker image inspect -f '{{.Id}}' "$APP_IMAGE" 2>/dev/null || true)"
-
-  # Build the new image FIRST while the current container keeps serving,
-  # so the only gap is the stop -> start swap (a few seconds), not the build.
-  log "Building image: $APP_IMAGE"
-  docker build -t "$APP_IMAGE" --label com.9router.managed=true .
-
-  stop_app
-  log "Starting app container (sqlite) on port $APP_PORT"
-  docker run -d --name "$APP_NAME" \
-    -p "${APP_PORT}:20128" \
-    --env-file "$ENV_FILE" \
-    -e DB_MODE=sqlite \
-    -v "${APP_DATA_VOLUME}:/app/data" \
-    "$APP_IMAGE" >/dev/null
-  wait_for_app
-  remove_old_image "$old_image_id"
-  cleanup_dangling
-  if [ "${PRUNE_BUILD_CACHE:-false}" = "true" ]; then
-    docker builder prune -f --filter "until=168h" >/dev/null 2>&1 || true
-  fi
-  log "Up. App: http://localhost:${APP_PORT}"
-}
-
-run_mariadb() {
-  log "Mode: mariadb"
+do_up() {
   ensure_db_password
-  DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-$DB_PASSWORD}"
-  export DB_ROOT_PASSWORD
+  profile_args
 
-  ensure_network
-
-  # Create/start the MariaDB sidecar (idempotent; never destroys the volume).
-  if container_running "$MARIA_CONTAINER"; then
-    log "MariaDB container already running: $MARIA_CONTAINER"
-  else
-    if container_exists "$MARIA_CONTAINER"; then
-      log "Starting existing MariaDB container: $MARIA_CONTAINER"
-      docker start "$MARIA_CONTAINER" >/dev/null
-    else
-      log "Creating MariaDB container: $MARIA_CONTAINER"
-      docker run -d --name "$MARIA_CONTAINER" \
-        --network "$NETWORK" \
-        -p "${MARIA_HOST_PORT}:${DB_PORT}" \
-        -v "${MARIA_VOLUME}:/var/lib/mysql" \
-        -e MARIADB_ROOT_PASSWORD="$DB_ROOT_PASSWORD" \
-        -e MARIADB_DATABASE="$DB_NAME" \
-        -e MARIADB_USER="$DB_USER" \
-        -e MARIADB_PASSWORD="$DB_PASSWORD" \
-        "$MARIA_IMAGE" \
-        --port="${DB_PORT}" \
-        --character-set-server=utf8mb4 \
-        --collation-server=utf8mb4_unicode_ci >/dev/null
-    fi
+  if ! is_mariadb; then
+    # Switching back to sqlite: drop any lingering MariaDB sidecar (like the
+    # old script did) so the two modes never fight over the DB.
+    docker compose --profile "$MARIA_SERVICE" rm -sf "$MARIA_SERVICE" >/dev/null 2>&1 || true
   fi
 
-  wait_for_maria
-
-  # Remember the current image so we can drop it after a successful swap.
-  local old_image_id
-  old_image_id="$(docker image inspect -f '{{.Id}}' "$APP_IMAGE" 2>/dev/null || true)"
-
-  # Build the new image FIRST while the current container keeps serving,
-  # so the only gap is the stop -> start swap (a few seconds), not the build.
-  log "Building image: $APP_IMAGE"
-  docker build -t "$APP_IMAGE" --label com.9router.managed=true .
-
-  stop_app
-  log "Starting app container (mariadb) on port $APP_PORT"
-  docker run -d --name "$APP_NAME" \
-    --network "$NETWORK" \
-    -p "${APP_PORT}:20128" \
-    --env-file "$ENV_FILE" \
-    -e DB_MODE=mariadb \
-    -e DB_HOST="$MARIA_CONTAINER" \
-    -e DB_PORT="$DB_PORT" \
-    -e DB_USER="$DB_USER" \
-    -e DB_PASSWORD="$DB_PASSWORD" \
-    -e DB_NAME="$DB_NAME" \
-    -v "${APP_DATA_VOLUME}:/app/data" \
-    "$APP_IMAGE" >/dev/null
-
-  wait_for_app
-  remove_old_image "$old_image_id"
-  cleanup_dangling
-  if [ "${PRUNE_BUILD_CACHE:-false}" = "true" ]; then
-    docker builder prune -f --filter "until=168h" >/dev/null 2>&1 || true
+  # --build rebuilds the local image BEFORE the container is recreated, so the
+  # running image always matches the current source (and never a stale pull).
+  log "Building local image and starting stack (mode: ${DB_MODE})"
+  docker compose "${PROFILE_ARGS[@]}" up -d --build
+  log "Up. App: http://localhost:20128"
+  if is_mariadb; then
+    log "MariaDB sidecar: service=${MARIA_SERVICE} db=${DB_NAME:-9router} user=${DB_USER:-9router}"
+    log "Note: an existing SQLite file (if any) is auto-migrated into MariaDB on first boot."
   fi
-  log "Up. App: http://localhost:${APP_PORT}"
-  log "MariaDB: host=${MARIA_CONTAINER} port=${DB_PORT} db=${DB_NAME} user=${DB_USER}"
-  log "Note: an existing SQLite file (if any) is auto-migrated into MariaDB on first boot."
-}
-
-force_migrate() {
-  log "Forcing SQLite -> MariaDB migration on next boot"
-  ensure_db_password
-  ensure_network
-  if ! container_running "$MARIA_CONTAINER"; then
-    die "MariaDB container '$MARIA_CONTAINER' is not running. Run './start.sh' with DB_MODE=mariadb first."
-  fi
-  # Drop the guard marker so migrate.js re-runs the copy, then restart the app.
-  docker run --rm -v "${APP_DATA_VOLUME}:/app/data" alpine \
-    sh -c 'rm -f /app/data/db/.migrated-to-mariadb' >/dev/null 2>&1 || true
-
-  DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-$DB_PASSWORD}"
-  stop_app
-  docker run -d --name "$APP_NAME" \
-    --network "$NETWORK" \
-    -p "${APP_PORT}:20128" \
-    --env-file "$ENV_FILE" \
-    -e DB_MODE=mariadb \
-    -e DB_HOST="$MARIA_CONTAINER" \
-    -e DB_PORT="$DB_PORT" \
-    -e DB_USER="$DB_USER" \
-    -e DB_PASSWORD="$DB_PASSWORD" \
-    -e DB_NAME="$DB_NAME" \
-    -e DB_MIGRATE_FORCE=1 \
-    -v "${APP_DATA_VOLUME}:/app/data" \
-    "$APP_IMAGE" >/dev/null
-  wait_for_app
-  log "Restarted app; migration will run on boot."
 }
 
 do_down() {
   local purge=0
-  [ "${1:-}" = "--volumes" ] && purge=1
-  stop_app
-  stop_maria
-  cleanup_network
+  case "${1:-}" in
+    --volumes|-v) purge=1 ;;
+  esac
+  # Always include the mariadb profile so a sidecar started in MariaDB mode is
+  # also torn down (plain `docker compose down` leaves profiled services running).
   if [ "$purge" -eq 1 ]; then
     warn "Removing named volumes (${APP_DATA_VOLUME}, ${MARIA_VOLUME}) — DATA WILL BE LOST"
-    docker volume rm "$APP_DATA_VOLUME" "$MARIA_VOLUME" >/dev/null 2>&1 || true
+    docker compose --profile "$MARIA_SERVICE" down -v
+  else
+    docker compose --profile "$MARIA_SERVICE" down
   fi
   log "Down."
 }
 
+do_restart() {
+  profile_args
+  if [ -n "$(docker compose "${PROFILE_ARGS[@]}" ps -aq "$APP_SERVICE" 2>/dev/null)" ]; then
+    log "Restarting service: $APP_SERVICE"
+    docker compose "${PROFILE_ARGS[@]}" restart "$APP_SERVICE"
+  else
+    warn "App container not found; running 'up' instead."
+    do_up
+  fi
+}
+
 do_logs() {
-  local svc="${1:-$APP_NAME}"
-  docker logs -f "$svc"
+  local svc
+  svc="$(normalize_service "${1:-}")"
+  profile_args
+  # A request for the mariadb service needs the profile even in sqlite mode.
+  if [ "$svc" = "$MARIA_SERVICE" ] && ! is_mariadb; then
+    PROFILE_ARGS=(--profile "$MARIA_SERVICE")
+  fi
+  docker compose "${PROFILE_ARGS[@]}" logs -f "$svc"
 }
 
 do_status() {
-  docker ps -a --filter "name=${APP_NAME}" --filter "name=${MARIA_CONTAINER}" \
-    --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+  profile_args
+  docker compose "${PROFILE_ARGS[@]}" ps -a
+}
+
+do_migrate() {
+  ensure_db_password
+  if [ -z "$(docker compose --profile "$MARIA_SERVICE" ps --status running -q "$MARIA_SERVICE" 2>/dev/null)" ]; then
+    die "MariaDB is not running. Start MariaDB mode first: DB_MODE=mariadb ./start.sh up"
+  fi
+  log "Forcing SQLite -> MariaDB migration on next boot"
+  # Drop the guard marker so migrate.js re-runs the copy.
+  docker compose --profile "$MARIA_SERVICE" run --rm --no-deps \
+    --entrypoint sh "$APP_SERVICE" -c 'rm -f /app/data/db/.migrated-to-mariadb' >/dev/null 2>&1 || true
+  # Recreate the app with DB_MIGRATE_FORCE=1 (compose reads it via interpolation).
+  DB_MIGRATE_FORCE=1 docker compose --profile "$MARIA_SERVICE" up -d --force-recreate "$APP_SERVICE"
+  log "Restarted app; migration will run on boot."
 }
 
 do_prune() {
-  log "Removing dangling 9router images..."
-  cleanup_dangling
+  log "Removing dangling images..."
+  docker image prune -f >/dev/null 2>&1 || true
   warn "docker builder prune clears BuildKit cache for ALL projects on this host (next builds may be slower)."
   docker builder prune -f >/dev/null 2>&1 || true
-  cleanup_network
   log "Pruned."
 }
 
@@ -381,26 +256,12 @@ main() {
   require_docker
 
   case "$cmd" in
-    up|"")
-      case "$DB_MODE" in
-        mariadb|mysql) run_mariadb ;;
-        *) run_sqlite ;;
-      esac
-      ;;
+    up|"")     do_up ;;
+    build)     do_build ;;
     down)      do_down "${1:-}" ;;
-    restart)
-      if container_exists "$APP_NAME"; then
-        docker start "$APP_NAME" >/dev/null && log "Restarted app container."
-      else
-        warn "App container not found; running 'up' instead."
-        case "$DB_MODE" in
-          mariadb|mysql) run_mariadb ;;
-          *) run_sqlite ;;
-        esac
-      fi
-      ;;
+    restart)   do_restart ;;
     logs)      do_logs "${1:-}" ;;
-    migrate)   force_migrate ;;
+    migrate)   do_migrate ;;
     prune)     do_prune ;;
     status)    do_status ;;
     *)         die "Unknown command: $cmd (try './start.sh help')" ;;

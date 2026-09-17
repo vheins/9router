@@ -741,6 +741,16 @@ export default function ProfilePage() {
 
   const observabilityEnabled = settings.enableObservability === true;
 
+  // Database info for the "Local Mode" card (from GET /api/settings → `database`).
+  // Falls back to the legacy SQLite path when an older server omits the field.
+  const dbInfo = settings?.database || null;
+  const isMariaDb = dbInfo?.mode === "mariadb";
+  const dbLabel = isMariaDb ? "Database Server" : "Database Location";
+  const dbValue = isMariaDb
+    ? `${dbInfo.host}:${dbInfo.port}/${dbInfo.database}`
+    : dbInfo?.file || "~/.9router/db/data.sqlite";
+  const dbDriver = dbInfo?.driver || null;
+
   const handleShutdown = async () => {
     setIsShuttingDown(true);
     try {
@@ -801,9 +811,18 @@ export default function ProfilePage() {
           </div>
           <div className="flex flex-col gap-3 pt-4 border-t border-border">
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between p-3 rounded-lg bg-bg border border-border gap-2">
-              <div>
-                <p className="font-medium text-sm sm:text-base">Database Location</p>
-                <p className="text-xs sm:text-sm text-text-muted font-mono break-all">~/.9router/db/data.sqlite</p>
+              <div className="min-w-0">
+                {/* key forces a fresh text node when the label changes so the
+                    runtime i18n re-translates it (it only observes added nodes). */}
+                <p key={dbLabel} className="font-medium text-sm sm:text-base">{dbLabel}</p>
+                <p className="text-xs sm:text-sm text-text-muted font-mono break-all" data-i18n-skip="true">
+                  {dbValue}
+                </p>
+                {dbDriver && (
+                  <p className="text-[11px] text-text-muted mt-0.5" data-i18n-skip="true">
+                    Driver: {dbDriver}
+                  </p>
+                )}
               </div>
             </div>
             <div className="flex flex-col sm:flex-row gap-2">

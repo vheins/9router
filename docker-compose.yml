@@ -1,6 +1,26 @@
+# 9router — Docker Compose stack.
+#
+# SQLite (default, backward compatible):
+#   docker compose up -d
+#
+# MariaDB (opt-in via profile):
+#   echo "DB_MODE=mariadb" >> .env
+#   docker compose --profile mariadb up -d
+#
+# `./start.sh` is a thin wrapper around these commands (see ./start.sh help).
+#
+# The app service is built from LOCAL source (this repo) as image `9router:local`
+# rather than pulled from Docker Hub. `decolua/9router:latest` is a published
+# snapshot that can lag behind the repo (e.g. it predates MariaDB support), so
+# building locally guarantees the running image matches the current source.
+#   docker compose build 9router
+#   docker compose [--profile mariadb] up -d --build
 services:
   9router:
-    image: decolua/9router:latest
+    image: 9router:local
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: 9router
     restart: always
     ports:
@@ -15,8 +35,57 @@ services:
       HOSTNAME: "0.0.0.0"
       NODE_ENV: production
       HEADROOM_URL: http://headroom:8787
+      # Database mode: "sqlite" (default) or "mariadb".
+      # For MariaDB: set DB_MODE=mariadb in .env, then:
+      #   docker compose --profile mariadb up
+      DB_MODE: ${DB_MODE:-sqlite}
+      DB_HOST: ${DB_HOST:-mariadb}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-9router}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_NAME: ${DB_NAME:-9router}
+      DB_CONNECTION_LIMIT: ${DB_CONNECTION_LIMIT:-10}
+      # Set to 1 to force a re-run of the one-time SQLite -> MariaDB copy.
+      # Normally injected by `./start.sh migrate`.
+      DB_MIGRATE_FORCE: ${DB_MIGRATE_FORCE:-0}
+    networks:
+      - 9router-net
     depends_on:
-      - headroom
+      headroom:
+        condition: service_started
+        required: false
+      mariadb:
+        condition: service_healthy
+        required: false
+
+  mariadb:
+    image: ${MARIA_IMAGE:-mariadb:11}
+    container_name: 9router-mariadb
+    restart: always
+    profiles:
+      - mariadb
+    command:
+      - --port=${DB_PORT:-3306}
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "${MARIA_HOST_PORT:-${DB_PORT:-3306}}:${DB_PORT:-3306}"
+    environment:
+      # Root password falls back to DB_PASSWORD when DB_ROOT_PASSWORD is unset.
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-${DB_PASSWORD}}
+      MARIADB_DATABASE: ${DB_NAME:-9router}
+      MARIADB_USER: ${DB_USER:-9router}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - 9router-mariadb-data:/var/lib/mysql
+    networks:
+      - 9router-net
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   headroom:
     image: ghcr.io/chopratejas/headroom:latest
@@ -24,7 +93,15 @@ services:
     restart: always
     ports:
       - "8787:8787"
+    networks:
+      - 9router-net
 
 volumes:
   9router-data:
     name: 9router-data
+  9router-mariadb-data:
+    name: 9router-mariadb-data
+
+networks:
+  9router-net:
+    name: 9router-net

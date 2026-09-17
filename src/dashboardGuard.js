@@ -31,6 +31,8 @@ const PUBLIC_API_PATHS = [
   "/api/auth/saml",
   "/api/version",
   "/api/settings/require-login",
+  // Boot trigger for custom-server.js self-fetch; self-guarded by NINEROUTER_BOOT_TOKEN.
+  "/api/internal/boot",
 ];
 
 // Public top-level prefixes (LLM API endpoints with their own API key auth).

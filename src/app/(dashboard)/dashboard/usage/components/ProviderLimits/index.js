@@ -7,7 +7,6 @@ import Toggle from "@/shared/components/Toggle";
 import Tooltip from "@/shared/components/Tooltip";
 import {
   parseQuotaData,
-  calculatePercentage,
   filterQuotasByVisibility,
   getHiddenQuotaRows,
   getQuotaVisibilityKey,
@@ -30,7 +29,6 @@ import {
   QUOTA_CACHE_KEY,
   REFRESH_INTERVAL_MS,
   CLAUDE_REFRESH_INTERVAL_MS,
-  DEPLETED_QUOTA_THRESHOLD,
   AUTO_REFRESH_STORAGE_KEY,
   CONNECTIONS_PAGE_SIZE,
   ACCOUNT_PAGE_SIZE_OPTIONS,
@@ -38,6 +36,7 @@ import {
   ACCOUNT_FILTER_OPTIONS,
   QUOTA_SORT_OPTIONS,
 } from "./utils";
+import { isQuotaRowDepleted } from "@/shared/quota/availability";
 import Card from "@/shared/components/Card";
 import { ConfirmModal, EditConnectionModal } from "@/shared/components";
 import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
@@ -150,6 +149,7 @@ export default function ProviderLimits() {
   const [accountFilter, setAccountFilter] = useState("all");
   const [quotaSortMode, setQuotaSortMode] = useState("default");
   const [quotaVisibility, setQuotaVisibility] = useState({});
+  const [quotaAutoToggleEnabled, setQuotaAutoToggleEnabled] = useState(false);
   const [expiringFirst, setExpiringFirst] = useState(false);
   const [providerMenuOpen, setProviderMenuOpen] = useState(false);
   const [bulkToggling, setBulkToggling] = useState(false);
@@ -547,6 +547,7 @@ export default function ProviderLimits() {
           codex: s?.codexAutoPing?.connections || {},
         });
         setQuotaVisibility(s?.quotaVisibility || {});
+        setQuotaAutoToggleEnabled(s?.quotaAutoToggleEnabled === true);
       })
       .catch(() => {});
   }, []);
@@ -587,6 +588,25 @@ export default function ProviderLimits() {
       setQuotaVisibility(previousVisibility);
     }
   }, []);
+
+  const updateQuotaAutoToggle = useCallback(
+    async (nextEnabled) => {
+      const previous = quotaAutoToggleEnabled;
+      setQuotaAutoToggleEnabled(nextEnabled);
+      try {
+        const response = await fetch("/api/settings", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ quotaAutoToggleEnabled: nextEnabled }),
+        });
+        if (!response.ok) throw new Error("Failed to update quota auto-toggle");
+      } catch (error) {
+        console.error("Error updating quota auto-toggle:", error);
+        setQuotaAutoToggleEnabled(previous);
+      }
+    },
+    [quotaAutoToggleEnabled],
+  );
 
   const handleHideQuota = useCallback((provider, quota) => {
     const key = getQuotaVisibilityKey(quota);
@@ -718,14 +738,12 @@ export default function ProviderLimits() {
     [connections, quotaData, expiringFirst, providerFilter, quotaSortMode],
   );
 
-  // Connection is depleted when any quota entry hit the threshold
+  // Connection is depleted when any quota entry hit the threshold.
+  // Uses the shared helper so this matches the background auto-toggle exactly.
   const isConnectionDepleted = (conn) => {
     const quotas = quotaData[conn.id]?.quotas;
     if (!quotas?.length) return false;
-    return quotas.some((q) => {
-      if (!q.total || q.total <= 0) return false;
-      return calculatePercentage(q.used, q.total) <= DEPLETED_QUOTA_THRESHOLD;
-    });
+    return quotas.some((q) => isQuotaRowDepleted(q));
   };
 
   const bulkSetActive = useCallback(
@@ -1016,6 +1034,28 @@ export default function ProviderLimits() {
             )}
           </button>
 
+          {/* Auto quota toggle: background on/off by quota */}
+          <button
+            type="button"
+            onClick={() => updateQuotaAutoToggle(!quotaAutoToggleEnabled)}
+            className="flex h-8 shrink-0 items-center gap-1 rounded-lg border border-black/10 px-2 text-xs transition-colors hover:bg-black/5 dark:border-white/10 dark:hover:bg-white/5"
+            title={
+              quotaAutoToggleEnabled
+                ? "Disable automatic quota on/off"
+                : "Automatically turn accounts off when their quota is empty and back on when it resets (checks every 5 minutes)"
+            }
+          >
+            <span
+              className={`material-symbols-outlined text-[14px] ${
+                quotaAutoToggleEnabled ? "text-primary" : "text-text-muted"
+              }`}
+            >
+              autorenew
+            </span>
+            <span className="hidden text-text-primary sm:inline">
+              Auto Toggle
+            </span>
+          </button>
 
           {/* Refresh all button */}
           <button

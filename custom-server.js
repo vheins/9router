@@ -13,37 +13,42 @@ const origCreate = http.createServer.bind(http);
 const PEER_TOKEN = crypto.randomBytes(24).toString("hex");
 process.env.NINEROUTER_PEER_TOKEN = PEER_TOKEN;
 
-let backgroundRefreshStarted = false;
+// Separate per-process secret for the internal boot self-fetch. Unlike the peer
+// token (which the request wrapper stamps on every request), this one is never
+// stamped by the wrapper, so it proves the caller is the in-process server.
+const BOOT_TOKEN = crypto.randomBytes(24).toString("hex");
+process.env.NINEROUTER_BOOT_TOKEN = BOOT_TOKEN;
 
-function startBackgroundTokenRefreshFromCustomServer() {
-  if (backgroundRefreshStarted) return;
-  backgroundRefreshStarted = true;
-  // Prefer source path (repo / standalone that still has src). Fail-open if missing
-  // — initializeApp also starts the same scheduler when the Next app boots.
-  const modPath = path.join(__dirname, "src", "sse", "services", "backgroundTokenRefresh.js");
-  import(pathToFileURL(modPath).href)
-    .then((m) => {
-      try {
-        m.startBackgroundTokenRefresh();
-      } catch (e) {
-        console.error("[BackgroundTokenRefresh] start failed:", e && e.message ? e.message : e);
-      }
-      const stop = () => {
-        try {
-          m.stopBackgroundTokenRefresh();
-        } catch {
-          /* ignore */
-        }
-      };
-      process.once("SIGINT", stop);
-      process.once("SIGTERM", stop);
+// Kick off the Next app bootstrap once the server is listening, so background
+// schedulers (quotaAutoToggle, backgroundTokenRefresh) and tunnel/MITM
+// auto-resume start at boot instead of lazily on the first dynamic page render.
+// Raw dynamic import() from this CJS file cannot resolve the bundler-only `@/`
+// and `open-sse` aliases, so we call a bundled API route over loopback instead.
+function triggerAppBootstrap(server) {
+  const addr = server && typeof server.address === "function" ? server.address() : null;
+  const port = addr && typeof addr === "object" ? addr.port : null;
+  if (!port) return;
+  const url = `http://127.0.0.1:${port}/api/internal/boot`;
+  const attempt = (retriesLeft) => {
+    fetch(url, {
+      method: "POST",
+      headers: {
+        "x-9r-peer-token": PEER_TOKEN,
+        "x-9r-boot-token": BOOT_TOKEN,
+      },
     })
-    .catch((e) => {
-      // Expected in published CLI standalone (src/ not on disk). App bootstrap covers it.
-      if (process.env.DEBUG_BACKGROUND_TOKEN_REFRESH) {
-        console.error("[BackgroundTokenRefresh] import failed:", e && e.message ? e.message : e);
-      }
-    });
+      .then((res) => {
+        if (!res.ok) throw new Error(`status ${res.status}`);
+      })
+      .catch((e) => {
+        if (retriesLeft > 0) {
+          setTimeout(() => attempt(retriesLeft - 1), 1000);
+        } else if (process.env.DEBUG_QUOTA_AUTO_TOGGLE) {
+          console.error("[InternalBoot] trigger failed:", e && e.message ? e.message : e);
+        }
+      });
+  };
+  attempt(3);
 }
 
 // Wrap Next standalone HTTP server: derive client IP from the TCP socket
@@ -74,7 +79,7 @@ http.createServer = (...args) => {
   };
   const server = origCreate(...rest, wrapped);
   server.once("listening", () => {
-    startBackgroundTokenRefreshFromCustomServer();
+    triggerAppBootstrap(server);
   });
   const origEmit = server.emit;
   // JBR 25 sends h2c upgrades that the HTTP/1.1 server would otherwise close.

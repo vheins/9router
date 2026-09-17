@@ -92,6 +92,16 @@ export const QUOTA_AUTOPING_CONFIG = {
   },
 };
 
+// Quota auto-toggle: background scheduler that turns connections OFF when their
+// quota is empty and back ON when quota is available again. Default ON (opt-out).
+export const QUOTA_AUTO_TOGGLE_CONFIG = {
+  tickIntervalMs: 300000,            // scan every 5 min
+  failureCooldownMs: 900000,         // skip a connection for 15 min after an error
+  perConnectionDelayMs: 250,         // small gap between provider API calls
+  // Match the dashboard's slower cadence for providers that rate-limit usage calls.
+  providerMinIntervalMs: { claude: 600000 },
+};
+
 // Re-export from providers.js for backward compatibility
 export {
   FREE_PROVIDERS,

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSettings, updateSettings } from "@/lib/localDb";
+import { getDbInfo } from "@/lib/db/driver.js";
 import { applyOutboundProxyEnv } from "@/lib/network/outboundProxy";
 import { resetComboRotation } from "open-sse/services/combo.js";
 import bcrypt from "bcryptjs";
@@ -27,7 +28,8 @@ export async function GET() {
       ...safeSettings, 
       enableRequestLogs,
       enableTranslator,
-      hasPassword: !!password
+      hasPassword: !!password,
+      database: getDbInfo()
     }, { headers: SETTINGS_RESPONSE_HEADERS });
   } catch (error) {
     console.log("Error getting settings:", error);
@@ -106,6 +108,14 @@ export async function PATCH(request) {
           configureQuotaAutoPing(settings);
         })
         .catch((error) => console.warn("[AutoPing] settings update failed:", error.message));
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, "quotaAutoToggleEnabled")) {
+      import("@/shared/services/quotaAutoToggle")
+        .then(({ configureQuotaAutoToggle }) => {
+          configureQuotaAutoToggle(settings);
+        })
+        .catch((error) => console.warn("[QuotaAutoToggle] settings update failed:", error.message));
     }
 
     const { password, oidcClientSecret, ...safeSettings } = settings;

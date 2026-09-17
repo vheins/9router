@@ -172,11 +172,26 @@ export function translate(sql) {
 }
 
 // ─── Column type mapping (DDL) ────────────────────────────────────────────
+
+// MariaDB type for a UUID primary key: fixed 36 chars, ascii charset (UUIDs are
+// ASCII), binary collation (case-sensitive, exact-match) → 36 bytes per value
+// instead of up to 255 under utf8mb4. Reused by migration 002 so DDL and the
+// ALTER stay in lockstep.
+export const UUID_CHAR_TYPE = "CHAR(36) CHARACTER SET ascii COLLATE ascii_bin";
+
+// Explicit `CHAR(36)` / `VARCHAR(128)` capture: base + optional length.
+const TYPE_RE = /^(TEXT|INTEGER|REAL|BLOB|NUMERIC|VARCHAR|CHAR)\b(\s*\(\s*\d+\s*\))?/i;
+
 /**
  * Map a SQLite column definition to a MariaDB column definition.
  * `opts.indexed` marks columns that participate in a PRIMARY KEY / UNIQUE / index —
  * those must be VARCHAR (InnoDB cannot index TEXT/BLOB without a key length),
  * everything else TEXT-ish becomes LONGTEXT so large JSON payloads fit.
+ *
+ * Explicit VARCHAR(N)/CHAR(N) lengths are honored (VARCHAR(128) stays 128, not
+ * widened to 255). CHAR(36) is our UUID convention and maps to the compact
+ * ascii_bin form (UUID_CHAR_TYPE). A length-less CHAR/VARCHAR keeps the legacy
+ * VARCHAR(255) default.
  */
 export function mapColumnType(sqliteType, opts = {}) {
   const indexed = !!opts.indexed;
@@ -187,8 +202,9 @@ export function mapColumnType(sqliteType, opts = {}) {
     return "BIGINT AUTO_INCREMENT PRIMARY KEY";
   }
 
-  const m = raw.match(/^(TEXT|INTEGER|REAL|BLOB|NUMERIC|VARCHAR|CHAR)\b/i);
+  const m = raw.match(TYPE_RE);
   const base = m ? m[1].toUpperCase() : "TEXT";
+  const lengthSpec = m && m[2] ? m[2].replace(/\s+/g, "") : ""; // e.g. "(128)"
   let rest = m ? raw.slice(m[0].length).trim() : raw;
 
   const isPk = /\bPRIMARY\s+KEY\b/i.test(rest);
@@ -214,7 +230,9 @@ export function mapColumnType(sqliteType, opts = {}) {
       break;
     case "VARCHAR":
     case "CHAR":
-      mappedBase = "VARCHAR(255)";
+      if (base === "CHAR" && lengthSpec === "(36)") mappedBase = UUID_CHAR_TYPE;
+      else if (lengthSpec) mappedBase = `${base}${lengthSpec}`;
+      else mappedBase = "VARCHAR(255)"; // bare CHAR/VARCHAR → legacy default
       break;
     default:
       mappedBase = needVarchar ? "VARCHAR(255)" : "LONGTEXT";

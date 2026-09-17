@@ -4,7 +4,7 @@ import path from "node:path";
 import { ensureDirs, DATA_FILE } from "./paths.js";
 
 // Use global to survive Next.js dev hot-reload (module state resets on reload)
-if (!global._dbAdapter) global._dbAdapter = { instance: null, initPromise: null, logged: false };
+if (!global._dbAdapter) global._dbAdapter = { instance: null, initPromise: null, logged: false, driver: null };
 const state = global._dbAdapter;
 
 // ─── DB mode ──────────────────────────────────────────────────────────────
@@ -14,6 +14,29 @@ export function getDbMode() {
   const raw = String(process.env.DB_MODE || "sqlite").trim().toLowerCase();
   if (raw === "mariadb" || raw === "mysql") return "mariadb";
   return "sqlite";
+}
+
+// Sanitized DB connection info for the dashboard (NEVER includes credentials).
+// - MariaDB: mode/driver + host/port/database (no user/password).
+// - SQLite:  mode + resolved data file path + the actual runtime driver once
+//            the adapter has been initialized (null before that).
+export function getDbInfo() {
+  const mode = getDbMode();
+  if (mode === "mariadb") {
+    const cfg = mariaConfigFromEnv();
+    return {
+      mode: "mariadb",
+      driver: "mariadb",
+      host: cfg.host,
+      port: cfg.port,
+      database: cfg.database,
+    };
+  }
+  return {
+    mode: "sqlite",
+    driver: state.driver || null,
+    file: DATA_FILE,
+  };
 }
 
 async function tryBunSqlite(filePath, opts) {
@@ -133,6 +156,7 @@ async function createMariaAdapter() {
   const cfg = mariaConfigFromEnv();
   const { createMariaDbAdapter } = await import("./adapters/mariadbAdapter.js");
   const adapter = await createMariaDbAdapter(cfg);
+  state.driver = adapter.driver || "mariadb";
   if (!state.logged) {
     console.log(`[DB] Driver: mariadb | host: ${cfg.host}:${cfg.port} | db: ${cfg.database}`);
     state.logged = true;
@@ -151,6 +175,7 @@ async function initAdapter() {
     //   Bun:  bun:sqlite → sql.js
     //   Node: better-sqlite3 → node:sqlite (≥22.5) → sql.js
     adapter = await openSqliteAdapter(DATA_FILE);
+    state.driver = adapter.driver || null;
     if (!state.logged) {
       console.log(`[DB] Driver: ${adapter.driver} | file: ${DATA_FILE}`);
       state.logged = true;

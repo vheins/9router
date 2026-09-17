@@ -103,25 +103,113 @@ docker run -d \
 | `DB_NAME` | `9router` | MariaDB database name |
 | `DB_CONNECTION_LIMIT` | `10` | Connection pool size |
 
-### Using `start.sh` (sidecar provisioning)
+### Using Docker Compose
 
-`start.sh` provisions everything for you. It creates a docker network, runs a
-`mariadb:11` sidecar with a named volume, waits for it to be healthy, then runs
-the app container pointed at it:
+The repo ships a `docker-compose.yml` that defines the app, an optional
+`headroom` sidecar, and a **profile-gated** MariaDB service. Plain
+`docker compose up` is SQLite-only (backward compatible); MariaDB is opt-in via
+the `mariadb` profile.
+
+> **The app service is built from local source.** `docker-compose.yml` uses
+> `image: 9router:local` with a `build: .` section, so `docker compose up -d
+> --build` compiles the app from the current checkout (this repo's `Dockerfile`)
+> and runs that image. The published `decolua/9router:latest` on Docker Hub is a
+> release snapshot and **can lag behind the repo** — for example, images built
+> before 2026-09-17 have no MariaDB support and will always boot SQLite even when
+> `DB_MODE=mariadb` is set. Building locally guarantees the running image matches
+> the source you have.
+
+```bash
+# SQLite (default) — build local image, then start (no MariaDB container)
+docker compose up -d --build
+
+# MariaDB — enable the mariadb profile
+echo "DB_MODE=mariadb" >> .env
+docker compose --profile mariadb up -d --build
+
+# Build the local image only (no start)
+docker compose build 9router
+```
+
+The `mariadb` service uses image `mariadb:11` (override with `MARIA_IMAGE`), a
+named volume `9router-mariadb-data:/var/lib/mysql`, and a
+`healthcheck.sh --connect --innodb_initialized` healthcheck that the app waits
+on before starting.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MARIA_IMAGE` | `mariadb:11` | MariaDB image |
+| `MARIA_HOST_PORT` | `DB_PORT` | Host port published for MariaDB |
+| `DB_ROOT_PASSWORD` | `DB_PASSWORD` | MariaDB root password (falls back to `DB_PASSWORD`) |
+
+Minimal example (excerpt of the shipped `docker-compose.yml`):
+
+```yaml
+services:
+  9router:
+    image: 9router:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: [.env]
+    environment:
+      DB_MODE: ${DB_MODE:-sqlite}
+      DB_HOST: ${DB_HOST:-mariadb}
+      DB_PORT: ${DB_PORT:-3306}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+        required: false
+
+  mariadb:
+    image: ${MARIA_IMAGE:-mariadb:11}
+    profiles: [mariadb]          # only started with --profile mariadb
+    environment:
+      MARIADB_DATABASE: ${DB_NAME:-9router}
+      MARIADB_USER: ${DB_USER:-9router}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-${DB_PASSWORD}}
+    volumes:
+      - 9router-mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+```
+
+If `DB_PASSWORD` is empty when you run `./start.sh` in MariaDB mode, it
+generates a random password and appends it to `.env` so it stays stable across
+runs. (Raw `docker compose` does not do this — set `DB_PASSWORD` yourself.)
+
+### Using `start.sh` (thin wrapper)
+
+`start.sh` is now a **thin wrapper around `docker compose`** — all container
+provisioning lives in `docker-compose.yml`. It reads `DB_MODE` from `.env` and
+adds `--profile mariadb` automatically when needed:
 
 ```bash
 # Put DB_MODE=mariadb (and optionally DB_NAME / DB_PASSWORD) in .env first:
 echo "DB_MODE=mariadb" >> .env
 
-./start.sh          # build + run in the mode from .env
-./start.sh status   # container status
-./start.sh logs     # tail app logs
-./start.sh down     # stop + remove containers (keeps volumes)
+./start.sh          # build local image, then docker compose [--profile mariadb] up -d --build
+./start.sh build    # docker compose build 9router (local image only)
+./start.sh status   # docker compose ps -a
+./start.sh logs     # docker compose logs -f 9router (or: logs mariadb)
+./start.sh down     # docker compose down (keeps volumes)
 ./start.sh help     # full command list
 ```
 
-If `DB_PASSWORD` is empty, `start.sh` generates a random password and appends
-it to `.env` so it stays stable across runs.
+Command → compose mapping:
+
+| `start.sh` | Equivalent |
+| --- | --- |
+| `./start.sh` / `up` | `docker compose build 9router` then `docker compose [--profile mariadb] up -d --build` |
+| `build` | `docker compose build 9router` |
+| `down` | `docker compose --profile mariadb down` |
+| `down --volumes` | `docker compose --profile mariadb down -v` (DESTRUCTIVE) |
+| `restart` | `docker compose restart 9router` |
+| `logs [svc]` | `docker compose logs -f [svc]` (default `9router`) |
+| `migrate` | removes the marker, then `DB_MIGRATE_FORCE=1 docker compose --profile mariadb up -d --force-recreate 9router` |
+| `status` | `docker compose ps -a` |
+| `prune` | `docker image prune -f` + `docker builder prune -f` |
 
 ### One-time auto-migration SQLite → MariaDB
 
@@ -133,7 +221,19 @@ columns) and writes a guard marker at `$DATA_DIR/db/.migrated-to-mariadb`.
 - The SQLite file is only **read**, never modified or deleted.
 - The copy runs **once**; subsequent boots skip it (marker present).
 - To force a re-copy: `./start.sh migrate`, or delete the marker file and
-  restart (or set `DB_MIGRATE_FORCE=1`).
+  restart, or set `DB_MIGRATE_FORCE=1` for the app container.
+
+`./start.sh migrate` requires the MariaDB service to be running. It removes the
+marker `/app/data/db/.migrated-to-mariadb` inside the `9router-data` volume and
+recreates the app with `DB_MIGRATE_FORCE=1` so the copy re-runs on boot. The
+equivalent raw compose command is:
+
+```bash
+DB_MIGRATE_FORCE=1 docker compose --profile mariadb up -d --force-recreate 9router
+```
+
+(combined with removing the marker first, e.g.
+`docker run --rm -v 9router-data:/app/data alpine sh -c 'rm -f /app/data/db/.migrated-to-mariadb'`).
 
 ## Optional Headroom sidecar
 
@@ -178,12 +278,18 @@ docker rm -f 9router
 ## Build image locally (test)
 
 ```bash
-cd app && docker build -t 9router .
+docker build -t 9router:local .
 
 docker run --rm -p 20128:20128 \
   -v "$HOME/.9router:/app/data" \
   -e DATA_DIR=/app/data \
-  9router
+  9router:local
+```
+
+Or via Compose (same image tag the stack uses):
+
+```bash
+docker compose build 9router
 ```
 
 ## Publish (automatic via CI)

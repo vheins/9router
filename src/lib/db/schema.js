@@ -5,7 +5,26 @@
 // to bump only skips that backup — it does NOT break the additive auto-sync.
 import { buildCreateTableMaria } from "./dialect.js";
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 3;
+
+// UUID primary keys are declared CHAR(36) — a fixed-width, binary-collated
+// string. SQLite treats CHAR as TEXT affinity (stores the same UUID string,
+// length not enforced); the MariaDB dialect maps CHAR(36) to
+// `CHAR(36) CHARACTER SET ascii COLLATE ascii_bin` (compact + case-sensitive
+// exact-match, ideal for UUID lookups). The app binds UUID strings unchanged.
+//
+// Only tables whose id is ALWAYS a UUID may use this. Tables whose repos use
+// `id: data.id || uuidv4()` (providerNodes, proxyPools) can receive a custom /
+// prefixed id on import (e.g. "openai-compatible-responses-<uuid>" = 64 chars),
+// so they must stay variable-length — see VARLEN_PK.
+const UUID_PK = "CHAR(36) PRIMARY KEY";
+
+// Variable-length primary key for tables whose id is not guaranteed to be a
+// UUID (imported/preset rows carry the original id verbatim). VARCHAR(255) is
+// the pre-optimization legacy width: enough headroom for any generated prefix
+// (worst case 64 chars today) and for arbitrary imported ids. SQLite keeps TEXT
+// affinity; the MariaDB dialect honors VARCHAR(255) verbatim.
+const VARLEN_PK = "VARCHAR(255) PRIMARY KEY";
 
 export const PRAGMA_SQL = `
 PRAGMA journal_mode = WAL;
@@ -35,7 +54,7 @@ export const TABLES = {
   },
   providerConnections: {
     columns: {
-      id: "TEXT PRIMARY KEY",
+      id: UUID_PK,
       provider: "TEXT NOT NULL",
       authType: "TEXT NOT NULL",
       name: "TEXT",
@@ -54,7 +73,10 @@ export const TABLES = {
   },
   providerNodes: {
     columns: {
-      id: "TEXT PRIMARY KEY",
+      // NOT a UUID: id may be a prefixed id (e.g.
+      // `openai-compatible-responses-<uuid>` = 64 chars) from createProviderNode
+      // (`data.id || uuidv4()`) or an arbitrary imported id → must stay VARCHAR.
+      id: VARLEN_PK,
       type: "TEXT",
       name: "TEXT",
       data: "TEXT NOT NULL",
@@ -65,7 +87,9 @@ export const TABLES = {
   },
   proxyPools: {
     columns: {
-      id: "TEXT PRIMARY KEY",
+      // NOT guaranteed UUID: createProxyPool uses `data.id || uuidv4()`, so an
+      // imported/preset pool can carry a custom id → must stay VARCHAR.
+      id: VARLEN_PK,
       isActive: "INTEGER DEFAULT 1",
       testStatus: "TEXT",
       data: "TEXT NOT NULL",
@@ -79,25 +103,27 @@ export const TABLES = {
   },
   apiKeys: {
     columns: {
-      id: "TEXT PRIMARY KEY",
+      id: UUID_PK,
       key: "TEXT UNIQUE NOT NULL",
       name: "TEXT",
       machineId: "TEXT",
       isActive: "INTEGER DEFAULT 1",
       createdAt: "TEXT NOT NULL",
     },
-    indexes: ["CREATE INDEX IF NOT EXISTS idx_ak_key ON apiKeys(key)"],
+    // No separate idx_ak_key: `key` is already UNIQUE (a redundant plain index
+    // just doubles write cost). Migration 002 drops it on existing MariaDB DBs.
   },
   combos: {
     columns: {
-      id: "TEXT PRIMARY KEY",
+      id: UUID_PK,
       name: "TEXT UNIQUE NOT NULL",
       kind: "TEXT",
       models: "TEXT NOT NULL",
       createdAt: "TEXT NOT NULL",
       updatedAt: "TEXT NOT NULL",
     },
-    indexes: ["CREATE INDEX IF NOT EXISTS idx_combo_name ON combos(name)"],
+    // No separate idx_combo_name: `name` is already UNIQUE. Migration 002 drops
+    // it on existing MariaDB DBs.
   },
   kv: {
     columns: {
@@ -139,7 +165,9 @@ export const TABLES = {
   },
   requestDetails: {
     columns: {
-      id: "TEXT PRIMARY KEY",
+      // NOT a UUID: composite `${ISO timestamp}-${random6}-${modelSlug}` (~40–90
+      // chars). VARCHAR(128) is a safe upper bound; SQLite keeps TEXT affinity.
+      id: "VARCHAR(128) PRIMARY KEY",
       timestamp: "TEXT NOT NULL",
       provider: "TEXT",
       model: "TEXT",
