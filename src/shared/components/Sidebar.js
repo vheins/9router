@@ -39,8 +39,20 @@ const systemItems = [
   { href: "/dashboard/skills", label: "Skills", icon: "extension" },
 ];
 
-export default function Sidebar({ onClose }) {
+export default function Sidebar({
+  onClose,
+  collapsed: externalCollapsed,
+  onToggleCollapse: externalToggleCollapse,
+}) {
   const pathname = usePathname();
+  const [internalCollapsed, setInternalCollapsed] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return localStorage.getItem("sidebar:collapsed") === "true";
+    } catch {
+      return false;
+    }
+  });
   const [mediaOpen, setMediaOpen] = useState(false);
   const [showRemoteModal, setShowRemoteModal] = useState(false);
   const [isDisconnected, setIsDisconnected] = useState(false);
@@ -52,6 +64,27 @@ export default function Sidebar({ onClose }) {
   const { copied, copy } = useCopyToClipboard(2000);
 
   const INSTALL_CMD = UPDATER_CONFIG.installCmdLatest;
+
+  const isControlled = externalCollapsed !== undefined;
+  // If onClose is provided (mobile drawer), it's never collapsed
+  const isCollapsed = onClose ? false : isControlled ? externalCollapsed : internalCollapsed;
+
+  const toggleCollapse = () => {
+    if (onClose) return;
+    if (isControlled && externalToggleCollapse) {
+      externalToggleCollapse();
+    } else {
+      setInternalCollapsed((prev) => {
+        const next = !prev;
+        try {
+          localStorage.setItem("sidebar:collapsed", String(next));
+        } catch {
+          // ignore
+        }
+        return next;
+      });
+    }
+  };
 
   useEffect(() => {
     fetch("/api/settings")
@@ -109,132 +142,214 @@ export default function Sidebar({ onClose }) {
 
   return (
     <>
-      <aside className="flex w-72 flex-col border-r border-border-subtle bg-vibrancy backdrop-blur-xl transition-colors duration-300 min-h-full">
-        {/* Traffic lights */}
-        <div className="flex items-center gap-2 px-6 pt-5 pb-2">
-          <div className="w-3 h-3 rounded-full bg-[#FF5F56]" />
-          <div className="w-3 h-3 rounded-full bg-[#FFBD2E]" />
-          <div className="w-3 h-3 rounded-full bg-[#27C93F]" />
+      <aside
+        className={cn(
+          "flex flex-col border-r border-border-subtle bg-vibrancy backdrop-blur-xl transition-[width] duration-200 ease-in-out min-h-full shrink-0 select-none overflow-x-hidden",
+          isCollapsed ? "w-16" : "w-72"
+        )}
+      >
+        {/* Traffic lights & header controls */}
+        <div
+          className={cn(
+            "flex items-center pt-5 pb-2 transition-all duration-200",
+            isCollapsed ? "justify-center px-2" : "justify-between px-6"
+          )}
+        >
+          <div className={cn("flex items-center", isCollapsed ? "gap-1.5" : "gap-2")}>
+            <div className={cn("rounded-full bg-[#FF5F56]", isCollapsed ? "size-2" : "size-3")} />
+            <div className={cn("rounded-full bg-[#FFBD2E]", isCollapsed ? "size-2" : "size-3")} />
+            <div className={cn("rounded-full bg-[#27C93F]", isCollapsed ? "size-2" : "size-3")} />
+          </div>
+          {!isCollapsed && !onClose && (
+            <button
+              type="button"
+              onClick={toggleCollapse}
+              aria-label="Collapse sidebar"
+              title="Collapse sidebar"
+              className="hidden lg:flex items-center justify-center size-6 rounded-md text-text-muted hover:bg-surface-2 hover:text-text-main transition-colors cursor-pointer"
+            >
+              <span className="material-symbols-outlined text-[18px]">chevron_left</span>
+            </button>
+          )}
+          {onClose && (
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close menu"
+              className="lg:hidden p-1 text-text-muted hover:text-text-main transition-colors cursor-pointer"
+            >
+              <span className="material-symbols-outlined text-[20px]">close</span>
+            </button>
+          )}
         </div>
 
         {/* Logo */}
-        <div className="px-6 py-4 flex flex-col gap-2">
-          <Link href="/dashboard" className="flex items-center gap-3">
-            <div className="flex items-center justify-center size-9 rounded-[10px] bg-gradient-to-br from-brand-500 to-brand-700 shadow-[var(--shadow-warm)]">
+        <div className={cn("flex flex-col gap-2 transition-all duration-200", isCollapsed ? "px-2 py-4 items-center" : "px-6 py-4")}>
+          <Link
+            href="/dashboard"
+            onClick={onClose}
+            title={isCollapsed ? `${APP_CONFIG.name} v${APP_CONFIG.version}` : undefined}
+            aria-label={APP_CONFIG.name}
+            className={cn("flex items-center transition-all", isCollapsed ? "justify-center" : "gap-3")}
+          >
+            <div className="flex items-center justify-center size-9 rounded-[10px] bg-gradient-to-br from-brand-500 to-brand-700 shadow-[var(--shadow-warm)] shrink-0">
               <span className="material-symbols-outlined text-white text-[20px]">hub</span>
             </div>
-            <div className="flex flex-col">
-              <h1 className="text-lg font-semibold tracking-tight text-text-main">
-                {APP_CONFIG.name}
-              </h1>
-              <span className="text-xs text-text-muted">v{APP_CONFIG.version}</span>
-            </div>
+            {!isCollapsed && (
+              <div className="flex flex-col min-w-0">
+                <h1 className="text-lg font-semibold tracking-tight text-text-main truncate">
+                  {APP_CONFIG.name}
+                </h1>
+                <span className="text-xs text-text-muted truncate">v{APP_CONFIG.version}</span>
+              </div>
+            )}
           </Link>
           {updateInfo && (
-            <div className="flex flex-col gap-1.5 rounded p-1 -m-1">
-              <span className="text-xs font-semibold text-green-600 dark:text-amber-500">
-                ↑ New version available: v{updateInfo.latestVersion}
-              </span>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => setShowUpdateModal(true)}
-                  className="px-2 py-1 rounded bg-green-600 hover:bg-green-700 dark:bg-amber-500 dark:hover:bg-amber-600 text-white text-[11px] font-semibold transition-colors cursor-pointer"
-                >
-                  Update now
-                </button>
-                <button
-                  onClick={() => copy(INSTALL_CMD)}
-                  title="Copy install command"
-                  className="flex-1 text-left hover:opacity-80 transition-opacity cursor-pointer min-w-0"
-                >
-                  <code className="block text-[10px] text-green-600/80 dark:text-amber-400/70 font-mono truncate">
-                    {copied ? "✓ copied!" : INSTALL_CMD}
-                  </code>
-                </button>
+            !isCollapsed ? (
+              <div className="flex flex-col gap-1.5 rounded p-1 -m-1">
+                <span className="text-xs font-semibold text-green-600 dark:text-amber-500">
+                  ↑ New version available: v{updateInfo.latestVersion}
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowUpdateModal(true)}
+                    className="px-2 py-1 rounded bg-green-600 hover:bg-green-700 dark:bg-amber-500 dark:hover:bg-amber-600 text-white text-[11px] font-semibold transition-colors cursor-pointer"
+                  >
+                    Update now
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => copy(INSTALL_CMD)}
+                    title="Copy install command"
+                    className="flex-1 text-left hover:opacity-80 transition-opacity cursor-pointer min-w-0"
+                  >
+                    <code className="block text-[10px] text-green-600/80 dark:text-amber-400/70 font-mono truncate">
+                      {copied ? "✓ copied!" : INSTALL_CMD}
+                    </code>
+                  </button>
+                </div>
               </div>
-            </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setShowUpdateModal(true)}
+                title={`New version available: v${updateInfo.latestVersion}`}
+                aria-label={`Update available: v${updateInfo.latestVersion}`}
+                className="relative flex items-center justify-center size-8 rounded-lg bg-green-500/10 dark:bg-amber-500/10 text-green-600 dark:text-amber-500 hover:bg-green-500/20 dark:hover:bg-amber-500/20 transition-colors cursor-pointer"
+              >
+                <span className="material-symbols-outlined text-[18px]">upgrade</span>
+                <span className="absolute top-1 right-1 size-2 rounded-full bg-green-500 dark:bg-amber-500" />
+              </button>
+            )
           )}
         </div>
 
         {/* Navigation */}
-        <nav className="flex-1 px-4 py-2 space-y-0.5 overflow-y-auto custom-scrollbar">
+        <nav className={cn("flex-1 py-2 space-y-1 overflow-y-auto overflow-x-hidden custom-scrollbar", isCollapsed ? "px-2" : "px-4")}>
           {navItems.map((item) => (
             <Link
               key={item.href}
               href={item.href}
               onClick={onClose}
+              title={isCollapsed ? item.label : undefined}
+              aria-label={item.label}
               className={cn(
-                "flex items-center gap-3 px-3 py-1 rounded-lg transition-all group",
+                "flex items-center rounded-lg transition-all group",
+                isCollapsed ? "justify-center p-2.5" : "gap-3 px-3 py-1.5",
                 isActive(item.href)
-                  ? "bg-primary/10 text-primary"
+                  ? "bg-primary/10 text-primary font-medium"
                   : "text-text-muted hover:bg-surface-2 hover:text-text-main"
               )}
             >
               <span
                 className={cn(
-                  "material-symbols-outlined text-[18px]",
+                  "material-symbols-outlined text-[18px] shrink-0",
                   isActive(item.href) ? "fill-1" : "group-hover:text-primary transition-colors"
                 )}
               >
                 {item.icon}
               </span>
-              <span className="text-[13px] font-medium">{item.label}</span>
+              {!isCollapsed && <span className="text-[13px] font-medium truncate whitespace-nowrap">{item.label}</span>}
             </Link>
           ))}
 
           {/* System section */}
-          <div className="pt-3 mt-2 space-y-0.5">
-            <p className="px-4 text-xs font-semibold text-text-muted/60 uppercase tracking-wider mb-2">
-              System
-            </p>
+          <div className="pt-2 mt-2 space-y-1">
+            {!isCollapsed ? (
+              <p className="px-4 text-xs font-semibold text-text-muted/60 uppercase tracking-wider mb-2">
+                System
+              </p>
+            ) : (
+              <div className="my-2 border-t border-border-subtle mx-1" />
+            )}
 
             {/* Media Providers accordion */}
             <button
+              type="button"
               onClick={() => setMediaOpen((v) => !v)}
+              title={isCollapsed ? "Media Providers" : undefined}
+              aria-label="Media Providers"
               className={cn(
-                "w-full flex items-center gap-3 px-3 py-1 rounded-lg transition-all group",
+                "w-full flex items-center rounded-lg transition-all group cursor-pointer",
+                isCollapsed ? "justify-center p-2.5" : "gap-3 px-3 py-1.5",
                 pathname.startsWith("/dashboard/media-providers")
                   ? "bg-primary/10 text-primary"
                   : "text-text-muted hover:bg-surface-2 hover:text-text-main"
               )}
             >
-              <span className="material-symbols-outlined text-[18px]">perm_media</span>
-              <span className="text-[13px] font-medium flex-1 text-left">Media Providers</span>
-              <span className="material-symbols-outlined text-[14px] transition-transform" style={{ transform: mediaOpen ? "rotate(180deg)" : "rotate(0deg)" }}>
-                expand_more
-              </span>
+              <span className="material-symbols-outlined text-[18px] shrink-0">perm_media</span>
+              {!isCollapsed && (
+                <>
+                  <span className="text-[13px] font-medium flex-1 text-left truncate whitespace-nowrap">
+                    Media Providers
+                  </span>
+                  <span
+                    className="material-symbols-outlined text-[14px] transition-transform"
+                    style={{ transform: mediaOpen ? "rotate(180deg)" : "rotate(0deg)" }}
+                  >
+                    expand_more
+                  </span>
+                </>
+              )}
             </button>
             {mediaOpen && (
-              <div className="pl-4">
+              <div className={cn(isCollapsed ? "space-y-1 my-1" : "pl-4 space-y-0.5")}>
                 {MEDIA_PROVIDER_KINDS.filter((k) => VISIBLE_MEDIA_KINDS.includes(k.id)).map((kind) => (
                   <Link
                     key={kind.id}
                     href={`/dashboard/media-providers/${kind.id}`}
                     onClick={onClose}
+                    title={isCollapsed ? kind.label : undefined}
+                    aria-label={kind.label}
                     className={cn(
-                      "flex items-center gap-3 px-4 py-1 rounded-lg transition-all group",
+                      "flex items-center rounded-lg transition-all group",
+                      isCollapsed ? "justify-center p-2" : "gap-3 px-4 py-1",
                       pathname.startsWith(`/dashboard/media-providers/${kind.id}`)
                         ? "bg-primary/10 text-primary"
                         : "text-text-muted hover:bg-surface-2 hover:text-text-main"
                     )}
                   >
-                    <span className="material-symbols-outlined text-[16px]">{kind.icon}</span>
-                    <span className="text-sm">{kind.label}</span>
+                    <span className="material-symbols-outlined text-[16px] shrink-0">{kind.icon}</span>
+                    {!isCollapsed && <span className="text-sm truncate whitespace-nowrap">{kind.label}</span>}
                   </Link>
                 ))}
                 <Link
                   key={COMBINED_WEB_ITEM.id}
                   href={COMBINED_WEB_ITEM.href}
                   onClick={onClose}
+                  title={isCollapsed ? COMBINED_WEB_ITEM.label : undefined}
+                  aria-label={COMBINED_WEB_ITEM.label}
                   className={cn(
-                    "flex items-center gap-3 px-4 py-1 rounded-lg transition-all group",
+                    "flex items-center rounded-lg transition-all group",
+                    isCollapsed ? "justify-center p-2" : "gap-3 px-4 py-1",
                     pathname.startsWith(COMBINED_WEB_ITEM.href)
                       ? "bg-primary/10 text-primary"
                       : "text-text-muted hover:bg-surface-2 hover:text-text-main"
                   )}
                 >
-                  <span className="material-symbols-outlined text-[16px]">{COMBINED_WEB_ITEM.icon}</span>
-                  <span className="text-sm">{COMBINED_WEB_ITEM.label}</span>
+                  <span className="material-symbols-outlined text-[16px] shrink-0">{COMBINED_WEB_ITEM.icon}</span>
+                  {!isCollapsed && <span className="text-sm truncate whitespace-nowrap">{COMBINED_WEB_ITEM.label}</span>}
                 </Link>
               </div>
             )}
@@ -244,8 +359,11 @@ export default function Sidebar({ onClose }) {
                 key={item.href}
                 href={item.href}
                 onClick={onClose}
+                title={isCollapsed ? item.label : undefined}
+                aria-label={item.label}
                 className={cn(
-                  "flex items-center gap-3 px-3 py-1 rounded-lg transition-all group",
+                  "flex items-center rounded-lg transition-all group",
+                  isCollapsed ? "justify-center p-2.5" : "gap-3 px-3 py-1.5",
                   isActive(item.href)
                     ? "bg-primary/10 text-primary"
                     : "text-text-muted hover:bg-surface-2 hover:text-text-main"
@@ -253,13 +371,13 @@ export default function Sidebar({ onClose }) {
               >
                 <span
                   className={cn(
-                    "material-symbols-outlined text-[18px]",
+                    "material-symbols-outlined text-[18px] shrink-0",
                     isActive(item.href) ? "fill-1" : "group-hover:text-primary transition-colors"
                   )}
                 >
                   {item.icon}
                 </span>
-                <span className="text-[13px] font-medium">{item.label}</span>
+                {!isCollapsed && <span className="text-[13px] font-medium truncate whitespace-nowrap">{item.label}</span>}
               </Link>
             ))}
 
@@ -271,8 +389,11 @@ export default function Sidebar({ onClose }) {
                   key={item.href}
                   href={item.href}
                   onClick={onClose}
+                  title={isCollapsed ? item.label : undefined}
+                  aria-label={item.label}
                   className={cn(
-                    "flex items-center gap-3 px-3 py-1 rounded-lg transition-all group",
+                    "flex items-center rounded-lg transition-all group",
+                    isCollapsed ? "justify-center p-2.5" : "gap-3 px-3 py-1.5",
                     isActive(item.href)
                       ? "bg-primary/10 text-primary"
                       : "text-text-muted hover:bg-surface-2 hover:text-text-main"
@@ -280,29 +401,33 @@ export default function Sidebar({ onClose }) {
                 >
                   <span
                     className={cn(
-                      "material-symbols-outlined text-[18px]",
+                      "material-symbols-outlined text-[18px] shrink-0",
                       isActive(item.href) ? "fill-1" : "group-hover:text-primary transition-colors"
                     )}
                   >
                     {item.icon}
                   </span>
-                  <span className="text-[13px] font-medium">{item.label}</span>
+                  {!isCollapsed && <span className="text-[13px] font-medium truncate whitespace-nowrap">{item.label}</span>}
                 </Link>
               ) : null;
             })}
 
             {/* Remote */}
             <button
+              type="button"
               onClick={() => setShowRemoteModal(true)}
+              title={isCollapsed ? "9Remote" : undefined}
+              aria-label="9Remote"
               className={cn(
-                "flex items-center gap-3 px-3 py-1 rounded-lg transition-all group w-full",
+                "flex items-center rounded-lg transition-all group w-full cursor-pointer",
+                isCollapsed ? "justify-center p-2.5" : "gap-3 px-3 py-1.5",
                 "text-text-muted hover:bg-surface-2 hover:text-text-main"
               )}
             >
-              <span className="material-symbols-outlined text-[18px] group-hover:text-primary transition-colors">
+              <span className="material-symbols-outlined text-[18px] shrink-0 group-hover:text-primary transition-colors">
                 computer
               </span>
-              <span className="text-[13px] font-medium">9Remote</span>
+              {!isCollapsed && <span className="text-[13px] font-medium truncate whitespace-nowrap">9Remote</span>}
             </button>
 
             {/* 9English */}
@@ -311,23 +436,29 @@ export default function Sidebar({ onClose }) {
               target="_blank"
               rel="noreferrer"
               onClick={onClose}
+              title={isCollapsed ? "9English" : undefined}
+              aria-label="9English"
               className={cn(
-                "flex items-center gap-3 px-3 py-1 rounded-lg transition-all group w-full",
+                "flex items-center rounded-lg transition-all group w-full",
+                isCollapsed ? "justify-center p-2.5" : "gap-3 px-3 py-1.5",
                 "text-text-muted hover:bg-surface-2 hover:text-text-main"
               )}
             >
-              <span className="material-symbols-outlined text-[18px] group-hover:text-primary transition-colors">
+              <span className="material-symbols-outlined text-[18px] shrink-0 group-hover:text-primary transition-colors">
                 translate
               </span>
-              <span className="text-[13px] font-medium">9English</span>
+              {!isCollapsed && <span className="text-[13px] font-medium truncate whitespace-nowrap">9English</span>}
             </a>
 
             {/* Settings */}
             <Link
               href="/dashboard/profile"
               onClick={onClose}
+              title={isCollapsed ? "Settings" : undefined}
+              aria-label="Settings"
               className={cn(
-                "flex items-center gap-3 px-3 py-1 rounded-lg transition-all group",
+                "flex items-center rounded-lg transition-all group",
+                isCollapsed ? "justify-center p-2.5" : "gap-3 px-3 py-1.5",
                 isActive("/dashboard/profile")
                   ? "bg-primary/10 text-primary"
                   : "text-text-muted hover:bg-surface-2 hover:text-text-main"
@@ -335,17 +466,39 @@ export default function Sidebar({ onClose }) {
             >
               <span
                 className={cn(
-                  "material-symbols-outlined text-[18px]",
+                  "material-symbols-outlined text-[18px] shrink-0",
                   isActive("/dashboard/profile") ? "fill-1" : "group-hover:text-primary transition-colors"
                 )}
               >
                 settings
               </span>
-              <span className="text-[13px] font-medium">Settings</span>
+              {!isCollapsed && <span className="text-[13px] font-medium truncate whitespace-nowrap">Settings</span>}
             </Link>
           </div>
         </nav>
 
+        {/* Toggle Collapse Button (Desktop only) */}
+        {!onClose && (
+          <div className="p-2 border-t border-border-subtle mt-auto shrink-0 hidden lg:block">
+            <button
+              type="button"
+              onClick={toggleCollapse}
+              aria-label={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              title={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              className={cn(
+                "w-full flex items-center rounded-lg text-text-muted hover:bg-surface-2 hover:text-text-main transition-all group cursor-pointer",
+                isCollapsed ? "justify-center p-2.5" : "gap-3 px-3 py-2 text-left"
+              )}
+            >
+              <span className="material-symbols-outlined text-[20px] shrink-0 group-hover:text-primary transition-colors">
+                {isCollapsed ? "chevron_right" : "chevron_left"}
+              </span>
+              {!isCollapsed && (
+                <span className="text-[13px] font-medium truncate whitespace-nowrap">Collapse</span>
+              )}
+            </button>
+          </div>
+        )}
       </aside>
 
       {/* Remote Promo Modal */}
@@ -396,6 +549,8 @@ export default function Sidebar({ onClose }) {
 
 Sidebar.propTypes = {
   onClose: PropTypes.func,
+  collapsed: PropTypes.bool,
+  onToggleCollapse: PropTypes.func,
 };
 
 function ManualUpdatePanel({ latestVersion, installCmd, copied, onCopyAndShutdown, onCancel, countdown, isDisconnected }) {

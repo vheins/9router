@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import PropTypes from "prop-types";
 import { usePathname } from "next/navigation";
 import { useNotificationStore } from "@/store/notificationStore";
 import Sidebar from "../Sidebar";
@@ -33,9 +34,29 @@ function getToastStyle(type) {
 
 export default function DashboardLayout({ children }) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return localStorage.getItem("sidebar:collapsed") === "true";
+    } catch {
+      return false;
+    }
+  });
   const pathname = usePathname();
   const notifications = useNotificationStore((state) => state.notifications);
   const removeNotification = useNotificationStore((state) => state.removeNotification);
+
+  const handleToggleCollapse = () => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem("sidebar:collapsed", String(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  };
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-bg">
@@ -77,8 +98,8 @@ export default function DashboardLayout({ children }) {
       )}
 
       {/* Sidebar - Desktop */}
-      <div className="hidden lg:flex">
-        <Sidebar />
+      <div className="hidden lg:flex shrink-0 h-full">
+        <Sidebar collapsed={sidebarCollapsed} onToggleCollapse={handleToggleCollapse} />
       </div>
 
       {/* Sidebar - Mobile */}
@@ -102,3 +123,7 @@ export default function DashboardLayout({ children }) {
     </div>
   );
 }
+
+DashboardLayout.propTypes = {
+  children: PropTypes.node,
+};
