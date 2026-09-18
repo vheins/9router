@@ -29,6 +29,11 @@ import {
 
 export const TOKEN_EXPIRY_BUFFER_MS = BUFFER_MS;
 
+// Max time the request path will wait for an in-flight token refresh before
+// failing open with the existing credentials. The background tick passes
+// force:true and waits unbounded (0).
+const TOKEN_REFRESH_WAIT_TIMEOUT_MS = Number(process.env.TOKEN_REFRESH_WAIT_TIMEOUT_MS) || 10000;
+
 // ─── Re-exports wrapped with local logger ─────────────────────────────────────
 
 export const refreshAccessToken = (provider, refreshToken, credentials) =>
@@ -86,6 +91,36 @@ export function releaseConnection(connectionId) {
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Await `promise` but never longer than `timeoutMs`.
+ *
+ * - timeoutMs <= 0 → wait unbounded (background tick, force:true).
+ * - On timeout → resolve { timedOut: true, value: null } so the caller proceeds
+ *   with the existing credentials (fail-open).
+ * - On refresh rejection → resolve { timedOut: false, value: null } (NOT throw):
+ *   preserves current behaviour where a failed refresh returns null and the
+ *   caller keeps the old credentials.
+ *
+ * @param {Promise<any>} promise
+ * @param {number} timeoutMs
+ * @returns {Promise<{ timedOut: boolean, value: any }>}
+ */
+function withBoundedWait(promise, timeoutMs) {
+  if (!timeoutMs || timeoutMs <= 0) {
+    return promise.then(
+      (v) => ({ timedOut: false, value: v }),
+      () => ({ timedOut: false, value: null }) // refresh failure -> fail-open
+    );
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve({ timedOut: true, value: null }), timeoutMs);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve({ timedOut: false, value: v }); },
+      () => { clearTimeout(timer); resolve({ timedOut: false, value: null }); } // refresh failure -> fail-open
+    );
+  });
+}
 
 /**
  * Compute an ISO expiry timestamp from a relative expiresIn (seconds).
@@ -217,8 +252,10 @@ export async function updateProviderCredentials(connectionId, newCredentials) {
  *
  * @param {string} provider
  * @param {object} credentials
- * @param {{ force?: boolean }} [options]  force=true skips the on-request lead check
- *   (used by background scheduler which applies a larger lead). Request path omits this.
+ * @param {{ force?: boolean, waitTimeoutMs?: number }} [options]  force=true skips the on-request lead check
+ *   (used by background scheduler which applies a larger lead) and waits unbounded.
+ *   waitTimeoutMs bounds the wait for an in-flight refresh on the request path
+ *   (defaults to TOKEN_REFRESH_WAIT_TIMEOUT_MS, or 0 when force=true).
  * @returns {Promise<object>} updated credentials object
  */
 export async function checkAndRefreshToken(provider, credentials, options = {}) {
@@ -228,6 +265,9 @@ export async function checkAndRefreshToken(provider, credentials, options = {}) 
   }
 
   const force = options?.force === true;
+  const waitTimeoutMs = options.waitTimeoutMs !== undefined
+    ? options.waitTimeoutMs
+    : (force ? 0 : TOKEN_REFRESH_WAIT_TIMEOUT_MS);
 
   // ── 1. Regular access-token expiry ────────────────────────────────────────
   if (force || _shouldRefreshCredentials(provider, creds)) {
@@ -242,7 +282,35 @@ export async function checkAndRefreshToken(provider, credentials, options = {}) 
       lastRefreshAt: creds.lastRefreshAt || null,
     });
 
-    const newCreds = await _refreshProviderCredentials(provider, creds, log);
+    const refreshPromise = _refreshProviderCredentials(provider, creds, log);
+    const { timedOut, value: newCreds } = await withBoundedWait(refreshPromise, waitTimeoutMs);
+
+    // Timed out waiting for an in-flight refresh: fail open with existing creds.
+    // The in-flight refresh does NOT persist itself, so we attach a continuation
+    // that persists its late result once it eventually resolves. Otherwise the
+    // fresh tokens (and any rotated refresh token) would be lost.
+    if (timedOut) {
+      log.warn("TOKEN_REFRESH", "Timed out waiting for in-flight refresh, using existing credentials", {
+        provider,
+        connectionId: creds.connectionId,
+        waitTimeoutMs,
+      });
+
+      refreshPromise
+        .then(async (lateCreds) => {
+          if (!(lateCreds?.accessToken || lateCreds?.apiKey || lateCreds?.copilotToken)) return;
+          const mergedLate = { ...lateCreds, existingProviderSpecificData: creds.providerSpecificData };
+          await updateProviderCredentials(creds.connectionId, mergedLate);
+          _refreshProjectId(provider, creds.connectionId, lateCreds.accessToken);
+        })
+        .catch((err) => {
+          log.debug("TOKEN_REFRESH", "Late in-flight refresh failed to persist", {
+            provider, connectionId: creds.connectionId, error: err?.message ?? String(err),
+          });
+        });
+      return creds;
+    }
+
     if (newCreds?.accessToken || newCreds?.apiKey || newCreds?.copilotToken) {
       const mergedCreds = {
         ...newCreds,
@@ -283,8 +351,34 @@ export async function checkAndRefreshToken(provider, credentials, options = {}) 
         expiresIn: copilotToken ? Math.round(remaining / 1000) : "missing",
       });
 
-      const copilotTokenResult = await refreshCopilotToken(creds.accessToken);
-      if (copilotTokenResult) {
+      const copilotPromise = refreshCopilotToken(creds.accessToken);
+      const { timedOut, value: copilotTokenResult } = await withBoundedWait(copilotPromise, waitTimeoutMs);
+
+      // Timed out: keep the existing copilot token and persist the late result
+      // once the in-flight refresh resolves (the refresh does not persist itself).
+      if (timedOut) {
+        log.warn("TOKEN_REFRESH", "Timed out waiting for Copilot token refresh, using existing token", {
+          provider,
+          connectionId: creds.connectionId,
+          waitTimeoutMs,
+        });
+
+        copilotPromise
+          .then(async (lateCopilot) => {
+            if (!lateCopilot) return;
+            const updatedSpecific = {
+              ...creds.providerSpecificData,
+              copilotToken: lateCopilot.token,
+              copilotTokenExpiresAt: lateCopilot.expiresAt,
+            };
+            await updateProviderCredentials(creds.connectionId, { providerSpecificData: updatedSpecific });
+          })
+          .catch((err) => {
+            log.debug("TOKEN_REFRESH", "Late Copilot refresh failed to persist", {
+              provider, connectionId: creds.connectionId, error: err?.message ?? String(err),
+            });
+          });
+      } else if (copilotTokenResult) {
         const updatedSpecific = {
           ...creds.providerSpecificData,
           copilotToken:          copilotTokenResult.token,

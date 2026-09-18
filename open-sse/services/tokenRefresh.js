@@ -42,6 +42,8 @@ export {
 
 export const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 
+const OAUTH_FETCH_TIMEOUT_MS = Number(process.env.OAUTH_REFRESH_TIMEOUT_MS) || 15000;
+
 export function isUnrecoverableRefreshError(result) {
   return (
     result &&
@@ -105,6 +107,7 @@ export async function refreshVertexToken(saJson, log) {
         grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
         assertion: jwt,
       }),
+      signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
     });
 
     if (!res.ok) {

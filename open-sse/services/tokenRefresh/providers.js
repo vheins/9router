@@ -4,6 +4,8 @@ import { proxyAwareFetch } from "../../utils/proxyFetch.js";
 import { dedupRefresh } from "./dedup.js";
 import { buildExternalIdpRefreshParams } from "../../../src/lib/oauth/kiroExternalIdp.js";
 
+const OAUTH_FETCH_TIMEOUT_MS = Number(process.env.OAUTH_REFRESH_TIMEOUT_MS) || 15000;
+
 let _xaiServiceSingleton = null;
 export async function refreshXaiToken(refreshToken, log) {
   if (!refreshToken) return null;
@@ -107,7 +109,7 @@ export async function refreshAccessToken(provider, refreshToken, credentials, lo
       Accept: "application/json",
       ...(profile.extraHeaders ? (profile.extraHeaders(credentials, config) || {}) : {}),
     };
-    const response = await fetch(url, { method: "POST", headers, body });
+    const response = await fetch(url, { method: "POST", headers, body, signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS) });
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -163,6 +165,7 @@ export async function refreshClineToken(refreshToken, log) {
           grantType: "refresh_token",
           clientType: "extension",
         }),
+        signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
       });
 
       if (!response.ok) {
@@ -215,6 +218,7 @@ export async function refreshGoogleToken(refreshToken, clientId, clientSecret, l
         client_id: clientId,
         client_secret: clientSecret,
       }),
+      signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -269,6 +273,7 @@ export async function refreshCodexToken(refreshToken, log) {
           grant_type: "refresh_token",
           refresh_token: refreshToken,
         }),
+        signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
       });
 
       if (!response.ok) {
@@ -347,6 +352,7 @@ export async function refreshKiroToken(refreshToken, providerSpecificData, log, 
         Accept: "application/json",
       },
       body: refreshRequest.body,
+      signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
     }, proxyOptions);
 
     if (!response.ok) {
@@ -392,6 +398,7 @@ export async function refreshKiroToken(refreshToken, providerSpecificData, log, 
         refreshToken: refreshToken,
         grantType: "refresh_token",
       }),
+      signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
     }, proxyOptions);
 
     if (!response.ok) {
@@ -428,6 +435,7 @@ export async function refreshKiroToken(refreshToken, providerSpecificData, log, 
     body: JSON.stringify({
       refreshToken: refreshToken,
     }),
+    signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
   }, proxyOptions);
 
   if (!response.ok) {
@@ -477,7 +485,8 @@ export async function refreshCopilotToken(githubAccessToken, log) {
         "Editor-Plugin-Version": `copilot-chat/${GITHUB_COPILOT.COPILOT_CHAT_VERSION}`,
         "Accept": "application/json",
         "x-github-api-version": GITHUB_COPILOT.API_VERSION
-      }
+      },
+      signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -529,6 +538,7 @@ export async function refreshCodebuddyToken(refreshToken, log) {
         "X-Product": "SaaS",
       },
       body: "{}",
+      signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -580,6 +590,7 @@ export async function refreshCodebuddyIntlToken(refreshToken, log) {
         "X-Product": "SaaS",
       },
       body: "{}",
+      signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -640,6 +651,7 @@ export async function refreshTraeToken(refreshToken, credentials, log) {
           ClientSecret: oauth.clientSecret || "-",
           UserID: "",
         }),
+        signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
       });
 
       if (!response.ok) {

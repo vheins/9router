@@ -250,7 +250,11 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     }
 
     // Account selection shown in the unified "▶" line (acc:...)
-    const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
+    // Bounded wait: never hang before the SSE stream is created. On timeout the
+    // existing credentials are used (fail-open); upstream 401 handling retries.
+    const refreshedCredentials = await checkAndRefreshToken(provider, credentials, {
+      waitTimeoutMs: Number(process.env.TOKEN_REFRESH_WAIT_TIMEOUT_MS) || 10000,
+    });
 
     // Ensure real project ID is available for providers that need it (P0 fix: cold miss)
     if ((provider === "antigravity" || provider === "gemini-cli") && !refreshedCredentials.projectId) {

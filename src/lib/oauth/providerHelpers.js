@@ -1,5 +1,7 @@
 const BASE64_BLOCK_SIZE = 4;
 
+const OAUTH_FETCH_TIMEOUT_MS = Number(process.env.OAUTH_REFRESH_TIMEOUT_MS) || 15000;
+
 function validateXaiOAuthEndpoint(rawUrl, field) {
   const value = String(rawUrl || "").trim();
   if (!value) throw new Error(`xai discovery ${field} is empty`);
@@ -61,6 +63,7 @@ export async function fetchKiroProfileArn(accessToken) {
         Authorization: `Bearer ${accessToken}`,
       },
       body: JSON.stringify({ maxResults: 10 }),
+      signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
     });
     if (!response.ok) return null;
     const data = await response.json();

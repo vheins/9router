@@ -9,6 +9,8 @@
 
 import { CLOUD_CODE_API, LOAD_CODE_ASSIST_HEADERS, ANTIGRAVITY_LOAD_CODE_ASSIST_HEADERS, LOAD_CODE_ASSIST_METADATA } from "../config/appConstants.js";
 
+const OAUTH_FETCH_TIMEOUT_MS = Number(process.env.OAUTH_REFRESH_TIMEOUT_MS) || 15000;
+
 // ─── Cache ────────────────────────────────────────────────────────────────────
 // connectionId -> { projectId: string, fetchedAt: number }
 const projectIdCache = new Map();
@@ -162,7 +164,7 @@ async function fetchProjectId(accessToken, signal, provider) {
         method: "POST",
         headers: { ...headers, "Authorization": `Bearer ${accessToken}` },
         body: JSON.stringify({ metadata: LOAD_CODE_ASSIST_METADATA }),
-        signal
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS)]) : AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS)
     });
 
     if (!response.ok) {
@@ -221,7 +223,7 @@ async function onboardUser(accessToken, tierID, externalSignal, endpoints, provi
                 method: "POST",
                 headers: { ...headers, "Authorization": `Bearer ${accessToken}` },
                 body: JSON.stringify(reqBody),
-                signal: localCtrl.signal
+                signal: AbortSignal.any([localCtrl.signal, AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS)])
             });
 
             clearTimeout(timeoutId);
@@ -249,7 +251,7 @@ async function onboardUser(accessToken, tierID, externalSignal, endpoints, provi
 
         } catch (error) {
             clearTimeout(timeoutId);
-            if (error.name === "AbortError") {
+            if (error.name === "AbortError" || error.name === "TimeoutError") {
                 console.warn(`[ProjectId] onboardUser attempt ${attempt} aborted (timeout or connection removed)`);
                 if (externalSignal?.aborted) return null;   // connection gone – stop retrying
                 continue;

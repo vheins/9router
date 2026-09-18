@@ -21,6 +21,8 @@ import { spinner as createSpinner } from "../utils/ui.js";
 
 const BASE64_BLOCK_SIZE = 4;
 
+const OAUTH_FETCH_TIMEOUT_MS = Number(process.env.OAUTH_REFRESH_TIMEOUT_MS) || 15000;
+
 let cachedDiscovery = null;
 
 export function validateOAuthEndpoint(rawUrl, field) {
@@ -55,6 +57,7 @@ export async function discoverEndpoints() {
   try {
     const res = await fetch(XAI_CONFIG.discoveryUrl, {
       headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
     });
     if (res.ok) {
       const data = await res.json();
@@ -140,6 +143,7 @@ export class XaiService extends OAuthService {
         redirect_uri: redirectUri,
         code_verifier: codeVerifier,
       }),
+      signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
     });
 
     if (!res.ok) {
@@ -165,6 +169,7 @@ export class XaiService extends OAuthService {
         client_id: XAI_CONFIG.clientId,
         refresh_token: refreshToken,
       }),
+      signal: AbortSignal.timeout(OAUTH_FETCH_TIMEOUT_MS),
     });
     if (!res.ok) {
       const err = await res.text();
