@@ -79,22 +79,40 @@ export default function UserTab({ period = "today" }) {
   const [valueMode, setValueMode] = useState("tokens");
   const [chartMode, setChartMode] = useState("tokens");
   const [selectedUser, setSelectedUser] = useState("all");
+  const [live, setLive] = useState(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    Promise.all([
-      fetch(`/api/usage/stats?period=${period}`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
-      fetch(`/api/usage/chart?period=${period}`).then((r) => (r.ok ? r.json() : [])).catch(() => []),
-    ])
-      .then(([s, c]) => {
-        if (cancelled) return;
-        if (s) setStats(s);
-        setChart(Array.isArray(c) ? c : []);
-      })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
+  const load = useCallback(async (signal) => {
+    const [s, c] = await Promise.all([
+      fetch(`/api/usage/stats?period=${period}`, { signal }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      fetch(`/api/usage/chart?period=${period}`, { signal }).then((r) => (r.ok ? r.json() : [])).catch(() => []),
+    ]);
+    if (s) setStats(s);
+    setChart(Array.isArray(c) ? c : []);
   }, [period]);
+
+  // Initial + period-change load.
+  useEffect(() => {
+    const ac = new AbortController();
+    setLoading(true);
+    load(ac.signal).finally(() => setLoading(false));
+    return () => ac.abort();
+  }, [load]);
+
+  // Realtime: the shared SSE stream emits an event whenever usage is written.
+  // We don't merge the stream's payload directly (it is always period="all");
+  // instead we refetch the REST stats/chart for the *selected* period, debounced
+  // so a burst of writes collapses into one refetch.
+  useEffect(() => {
+    let timer = null;
+    const es = new EventSource("/api/usage/stream");
+    es.onopen = () => setLive(true);
+    es.onmessage = () => {
+      if (timer) return;
+      timer = setTimeout(() => { timer = null; load(); }, 800);
+    };
+    es.onerror = () => setLive(false);
+    return () => { if (timer) clearTimeout(timer); es.close(); };
+  }, [load]);
 
   const users = useMemo(() => Object.values(stats?.byUser || {}), [stats]);
 
@@ -104,19 +122,23 @@ export default function UserTab({ period = "today" }) {
     const completionTokens = users.reduce((s, u) => s + (u.completionTokens || 0), 0);
     const cachedTokens = users.reduce((s, u) => s + (u.cachedTokens || 0), 0);
     const cost = users.reduce((s, u) => s + (u.cost || 0), 0);
-    // Latency averages weighted by request count (only successful samples).
-    let sumTtft = 0, sumTotal = 0, samples = 0;
+    // Latency averages weighted by the number of requests that actually
+    // recorded a sample. TPS uses summed sampled tokens / summed sampled time
+    // (NOT the averaged time, which would inflate throughput by the sample count).
+    let sumTtft = 0, sumTotal = 0, samples = 0, sampledCompletion = 0;
     for (const u of users) {
-      if (u.avgTotalMs != null && u.requests) {
-        sumTtft += (u.avgTtftMs || 0) * u.requests;
-        sumTotal += u.avgTotalMs * u.requests;
-        samples += u.requests;
+      const n = u.sampledRequests || 0;
+      if (u.avgTotalMs != null && n) {
+        sumTtft += (u.avgTtftMs || 0) * n;
+        sumTotal += u.avgTotalMs * n;
+        sampledCompletion += u.sampledCompletionTokens || 0;
+        samples += n;
       }
     }
     const avgTtftMs = samples ? Math.round(sumTtft / samples) : null;
     const avgTotalMs = samples ? Math.round(sumTotal / samples) : null;
     const totalTokens = promptTokens + completionTokens;
-    const tps = avgTotalMs ? Number((completionTokens / (avgTotalMs / 1000)).toFixed(1)) : null;
+    const tps = sumTotal > 0 ? Number((sampledCompletion / (sumTotal / 1000)).toFixed(1)) : null;
     const cacheHitRate = promptTokens ? cachedTokens / promptTokens : 0;
     const minutes = elapsedMinutes(period);
     return {
@@ -167,6 +189,9 @@ export default function UserTab({ period = "today" }) {
           avgTtftMs: m.avgTtftMs,
           avgTotalMs: m.avgTotalMs,
           tps: m.tps,
+          sampledRequests: m.sampledRequests || 0,
+          sampledCompletionTokens: m.sampledCompletionTokens || 0,
+          sampledTotalMs: m.sampledTotalMs || 0,
           tokensPerReq: m.tokensPerReq,
           lastUsed: m.lastUsed,
           lastSuccess: m.lastSuccess,
@@ -177,19 +202,22 @@ export default function UserTab({ period = "today" }) {
     if (groupBy === "user") {
       const agg = {};
       for (const r of out) {
-        const g = agg[r.user] || (agg[r.user] = { user: r.user, model: "—", provider: "", requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0, cost: 0, lastUsed: null, lastSuccess: null, lastError: null, _sTtft: 0, _sTotal: 0, _n: 0 });
+        const g = agg[r.user] || (agg[r.user] = { user: r.user, model: "—", provider: "", requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0, cost: 0, lastUsed: null, lastSuccess: null, lastError: null, _sTtft: 0, _sTotal: 0, _n: 0, _sComp: 0 });
         g.requests += r.requests; g.promptTokens += r.promptTokens; g.completionTokens += r.completionTokens;
         g.cachedTokens += r.cachedTokens; g.totalTokens += r.totalTokens; g.cost += r.cost;
         if (r.lastUsed && (!g.lastUsed || r.lastUsed > g.lastUsed)) g.lastUsed = r.lastUsed;
         if (r.lastSuccess && (!g.lastSuccess || r.lastSuccess > g.lastSuccess)) g.lastSuccess = r.lastSuccess;
         if (r.lastError && (!g.lastError || r.lastError > g.lastError)) g.lastError = r.lastError;
-        if (r.avgTotalMs != null) { g._sTtft += (r.avgTtftMs || 0) * r.requests; g._sTotal += r.avgTotalMs * r.requests; g._n += r.requests; }
+        if (r.avgTotalMs != null && r.sampledRequests) {
+          g._sTtft += (r.avgTtftMs || 0) * r.sampledRequests; g._sTotal += r.avgTotalMs * r.sampledRequests;
+          g._sComp += r.sampledCompletionTokens || 0; g._n += r.sampledRequests;
+        }
       }
       return Object.values(agg).map((g) => ({
         ...g,
         avgTtftMs: g._n ? Math.round(g._sTtft / g._n) : null,
         avgTotalMs: g._n ? Math.round(g._sTotal / g._n) : null,
-        tps: g._n && g._sTotal ? Number((g.completionTokens / (g._sTotal / 1000)).toFixed(1)) : null,
+        tps: g._sTotal > 0 ? Number((g._sComp / (g._sTotal / 1000)).toFixed(1)) : null,
         tokensPerReq: g.requests ? Math.round(g.totalTokens / g.requests) : 0,
       }));
     }
@@ -197,19 +225,22 @@ export default function UserTab({ period = "today" }) {
       const agg = {};
       for (const r of out) {
         const key = `${r.model}|${r.provider}`;
-        const g = agg[key] || (agg[key] = { user: "—", model: r.model, provider: r.provider, requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0, cost: 0, lastUsed: null, lastSuccess: null, lastError: null, _sTtft: 0, _sTotal: 0, _n: 0 });
+        const g = agg[key] || (agg[key] = { user: "—", model: r.model, provider: r.provider, requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0, cost: 0, lastUsed: null, lastSuccess: null, lastError: null, _sTtft: 0, _sTotal: 0, _n: 0, _sComp: 0 });
         g.requests += r.requests; g.promptTokens += r.promptTokens; g.completionTokens += r.completionTokens;
         g.cachedTokens += r.cachedTokens; g.totalTokens += r.totalTokens; g.cost += r.cost;
         if (r.lastUsed && (!g.lastUsed || r.lastUsed > g.lastUsed)) g.lastUsed = r.lastUsed;
         if (r.lastSuccess && (!g.lastSuccess || r.lastSuccess > g.lastSuccess)) g.lastSuccess = r.lastSuccess;
         if (r.lastError && (!g.lastError || r.lastError > g.lastError)) g.lastError = r.lastError;
-        if (r.avgTotalMs != null) { g._sTtft += (r.avgTtftMs || 0) * r.requests; g._sTotal += r.avgTotalMs * r.requests; g._n += r.requests; }
+        if (r.avgTotalMs != null && r.sampledRequests) {
+          g._sTtft += (r.avgTtftMs || 0) * r.sampledRequests; g._sTotal += r.avgTotalMs * r.sampledRequests;
+          g._sComp += r.sampledCompletionTokens || 0; g._n += r.sampledRequests;
+        }
       }
       return Object.values(agg).map((g) => ({
         ...g,
         avgTtftMs: g._n ? Math.round(g._sTtft / g._n) : null,
         avgTotalMs: g._n ? Math.round(g._sTotal / g._n) : null,
-        tps: g._n && g._sTotal ? Number((g.completionTokens / (g._sTotal / 1000)).toFixed(1)) : null,
+        tps: g._sTotal > 0 ? Number((g._sComp / (g._sTotal / 1000)).toFixed(1)) : null,
         tokensPerReq: g.requests ? Math.round(g.totalTokens / g.requests) : 0,
       }));
     }
@@ -253,6 +284,14 @@ export default function UserTab({ period = "today" }) {
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
+      {/* Live status */}
+      <div className="flex items-center gap-2 px-1">
+        <span className={`inline-flex h-2 w-2 rounded-full ${live ? "bg-success animate-pulse" : "bg-text-muted"}`} />
+        <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted">
+          {live ? "Live · updates automatically" : "Connecting…"}
+        </span>
+      </div>
+
       {/* Row 1 — headline totals */}
       <div className="grid min-w-0 grid-cols-2 gap-2 lg:grid-cols-4">
         <SummaryCard label="Users" value={fmt(totals.users)} sub="all keys" />
@@ -265,7 +304,7 @@ export default function UserTab({ period = "today" }) {
       <div className="grid min-w-0 grid-cols-2 gap-2 lg:grid-cols-6">
         <SummaryCard label="Avg TTFT" value={fmtMs(totals.avgTtftMs)} sub="first token" />
         <SummaryCard label="Avg Total" value={fmtMs(totals.avgTotalMs)} sub="wall time" />
-        <SummaryCard label="TPS" value={totals.tps == null ? "—" : `${totals.tps} tok/s`} sub={totals.avgTotalMs ? `incl. TTFT · ${(totals.avgTotalMs / Math.max(1, totals.completionTokens || 1)).toFixed(1)}ms/tok` : "—"} />
+        <SummaryCard label="TPS" value={totals.tps == null ? "—" : `${totals.tps} tok/s`} sub={totals.tps ? `incl. TTFT · ${(1000 / totals.tps).toFixed(1)}ms/tok` : "—"} />
         <SummaryCard label="Cache Hit" value={fmtPct(totals.cacheHitRate)} sub={`${fmt(totals.cachedTokens)} / ${fmt(totals.promptTokens)}`} />
         <SummaryCard label="Tok/Req" value={fmt(totals.tokensPerReq)} sub={`${fmt(Math.round(totals.promptTokens / Math.max(1, totals.requests)))} in · ${fmt(Math.round(totals.completionTokens / Math.max(1, totals.requests)))} out`} />
         <SummaryCard label="RPM" value={totals.rpm} sub="req/min avg" />

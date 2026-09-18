@@ -23,7 +23,18 @@ export async function GET() {
     
     const enableRequestLogs = process.env.ENABLE_REQUEST_LOGS === "true";
     const enableTranslator = process.env.ENABLE_TRANSLATOR === "true";
-    
+
+    // Report the EFFECTIVE observability state (env master switch wins over the
+    // persisted toggle) so the Profile switch reflects what is actually applied.
+    let observabilityEffective;
+    try {
+      const { isObservabilityEnabled } = await import("@/lib/db/repos/requestDetailsRepo.js");
+      observabilityEffective = await isObservabilityEnabled();
+    } catch {}
+    if (typeof observabilityEffective === "boolean") {
+      safeSettings.enableObservability = observabilityEffective;
+    }
+
     return NextResponse.json({ 
       ...safeSettings, 
       enableRequestLogs,

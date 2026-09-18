@@ -72,7 +72,11 @@ describe("stats.byUser aggregation", () => {
     // 3 successful latency samples: (1000,4000), (3000,6000), (500,1000)
     expect(rheza.avgTtftMs).toBe(Math.round((1000 + 3000 + 500) / 3));
     expect(rheza.avgTotalMs).toBe(Math.round((4000 + 6000 + 1000) / 3));
-    expect(rheza.tps).toBeGreaterThan(0);
+    // TPS = sampled output tokens / sampled total time = 1100 / 11s = 100.0.
+    // (The old bug divided the summed tokens by the AVERAGED time → ~300.)
+    expect(rheza.sampledRequests).toBe(3);
+    expect(rheza.sampledCompletionTokens).toBe(1100);
+    expect(rheza.tps).toBe(100);
     expect(rheza.lastSuccess).toBeTruthy();
     expect(rheza.lastError).toBeTruthy();
     expect(rheza.cacheHitRate).toBeCloseTo(800 / 2500, 4);

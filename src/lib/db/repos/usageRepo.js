@@ -126,7 +126,7 @@ function addUserRow(byUser, row, ctx) {
       promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0,
       keyName, apiKeyMasked, apiKeyKey: userKey, machineId: keyInfo?.machineId || null,
       models: {}, lastUsed: null, lastSuccess: null, lastError: null,
-      sumTtft: 0, sumTotal: 0, latencySamples: 0,
+      sumTtft: 0, sumTotal: 0, latencySamples: 0, latencyCompletionTokens: 0,
     };
   }
   const u = byUser[userKey];
@@ -140,7 +140,10 @@ function addUserRow(byUser, row, ctx) {
     u.cachedTokens += cachedTokens;
     u.cost += cost;
     if (ts && (!u.lastSuccess || new Date(ts) > new Date(u.lastSuccess))) u.lastSuccess = ts;
-    if (row.totalMs > 0) { u.sumTtft += row.ttftMs || 0; u.sumTotal += row.totalMs || 0; u.latencySamples += 1; }
+    if (row.totalMs > 0) {
+      u.sumTtft += row.ttftMs || 0; u.sumTotal += row.totalMs || 0;
+      u.latencyCompletionTokens += completionTokens; u.latencySamples += 1;
+    }
   }
   if (ts && (!u.lastUsed || new Date(ts) > new Date(u.lastUsed))) u.lastUsed = ts;
 
@@ -150,7 +153,7 @@ function addUserRow(byUser, row, ctx) {
       requests: 0, errorRequests: 0,
       promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0,
       rawModel: model, provider: providerDisplayName,
-      sumTtft: 0, sumTotal: 0, latencySamples: 0,
+      sumTtft: 0, sumTotal: 0, latencySamples: 0, latencyCompletionTokens: 0,
       lastUsed: null, lastSuccess: null, lastError: null,
     };
   }
@@ -165,7 +168,10 @@ function addUserRow(byUser, row, ctx) {
     m.cachedTokens += cachedTokens;
     m.cost += cost;
     if (ts && (!m.lastSuccess || new Date(ts) > new Date(m.lastSuccess))) m.lastSuccess = ts;
-    if (row.totalMs > 0) { m.sumTtft += row.ttftMs || 0; m.sumTotal += row.totalMs || 0; m.latencySamples += 1; }
+    if (row.totalMs > 0) {
+      m.sumTtft += row.ttftMs || 0; m.sumTotal += row.totalMs || 0;
+      m.latencyCompletionTokens += completionTokens; m.latencySamples += 1;
+    }
   }
   if (ts && (!m.lastUsed || new Date(ts) > new Date(m.lastUsed))) m.lastUsed = ts;
 }
@@ -264,6 +270,17 @@ export function trackPendingRequest(model, provider, connectionId, started, erro
 
   // [PENDING] console line removed; lifecycle is visible via "▶" and "📊 done" lines
   scheduleStatsEvent("pending");
+}
+
+// Cheap synchronous per-connection in-flight count (for p2c / least-loaded routing).
+// Reads the same in-memory tracker that powers getActiveRequests() — no DB access.
+export function getConnectionActiveCount(connectionId) {
+  if (!connectionId) return 0;
+  const models = pendingRequests.byAccount[connectionId];
+  if (!models) return 0;
+  let total = 0;
+  for (const count of Object.values(models)) total += count > 0 ? count : 0;
+  return total;
 }
 
 export async function getActiveRequests() {
@@ -776,18 +793,27 @@ export async function getUsageStats(period = "all") {
     u.totalTokens = u.promptTokens + u.completionTokens;
     u.avgTtftMs = u.latencySamples ? Math.round(u.sumTtft / u.latencySamples) : null;
     u.avgTotalMs = u.latencySamples ? Math.round(u.sumTotal / u.latencySamples) : null;
-    u.tps = u.avgTotalMs ? Number((u.completionTokens / (u.avgTotalMs / 1000)).toFixed(2)) : null;
+    // TPS = total output tokens / total wall time (NOT avg time — dividing the
+    // summed tokens by the per-request average inflates TPS by the sample count).
+    // Only requests that actually recorded latency contribute to both sides.
+    u.sampledRequests = u.latencySamples;
+    u.sampledCompletionTokens = u.latencyCompletionTokens;
+    u.sampledTotalMs = u.sumTotal;
+    u.tps = u.sumTotal > 0 ? Number((u.latencyCompletionTokens / (u.sumTotal / 1000)).toFixed(2)) : null;
     u.tokensPerReq = u.requests ? Math.round(u.totalTokens / u.requests) : 0;
     u.cacheHitRate = u.promptTokens ? Number((u.cachedTokens / u.promptTokens).toFixed(4)) : 0;
-    delete u.sumTtft; delete u.sumTotal; delete u.latencySamples;
+    delete u.sumTtft; delete u.sumTotal; delete u.latencySamples; delete u.latencyCompletionTokens;
     for (const m of Object.values(u.models)) {
       m.totalTokens = m.promptTokens + m.completionTokens;
       m.avgTtftMs = m.latencySamples ? Math.round(m.sumTtft / m.latencySamples) : null;
       m.avgTotalMs = m.latencySamples ? Math.round(m.sumTotal / m.latencySamples) : null;
-      m.tps = m.avgTotalMs ? Number((m.completionTokens / (m.avgTotalMs / 1000)).toFixed(2)) : null;
+      m.sampledRequests = m.latencySamples;
+      m.sampledCompletionTokens = m.latencyCompletionTokens;
+      m.sampledTotalMs = m.sumTotal;
+      m.tps = m.sumTotal > 0 ? Number((m.latencyCompletionTokens / (m.sumTotal / 1000)).toFixed(2)) : null;
       m.tokensPerReq = m.requests ? Math.round(m.totalTokens / m.requests) : 0;
       m.cacheHitRate = m.promptTokens ? Number((m.cachedTokens / m.promptTokens).toFixed(4)) : 0;
-      delete m.sumTtft; delete m.sumTotal; delete m.latencySamples;
+      delete m.sumTtft; delete m.sumTotal; delete m.latencySamples; delete m.latencyCompletionTokens;
     }
   }
   stats.byUser = byUser;

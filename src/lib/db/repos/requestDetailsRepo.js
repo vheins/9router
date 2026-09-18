@@ -18,6 +18,13 @@ export function invalidateObservabilityConfigCache() {
   cachedConfigTs = 0;
 }
 
+// Effective on/off as actually applied to DB capture (env master switch wins
+// over the persisted UI toggle). Used by GET /api/settings so the Profile
+// toggle reflects reality instead of the raw persisted value.
+export async function isObservabilityEnabled() {
+  return (await getObservabilityConfig()).enabled;
+}
+
 async function getObservabilityConfig() {
   if (cachedConfig && (Date.now() - cachedConfigTs) < CONFIG_CACHE_TTL_MS) return cachedConfig;
   try {
@@ -31,10 +38,11 @@ async function getObservabilityConfig() {
     // (Conflating them silently disabled the Details tab whenever a deployment
     // left the documented default ENABLE_REQUEST_LOGS=false in its .env.)
     //
-    // Precedence: an explicit UI choice (persisted raw setting) wins; otherwise
-    // the OBSERVABILITY_ENABLED env var; otherwise off. We must read the RAW
-    // settings row because getSettings() merges defaults, which would make the
-    // UI flag always look "explicitly set" and permanently shadow the env var.
+    // Precedence: an explicit OBSERVABILITY_ENABLED env var is a deployment-level
+    // master switch and wins when set (matches the pre-regression behavior and
+    // .env.example). Otherwise the persisted UI toggle decides; otherwise off.
+    // We read the RAW settings row via exportSettings() so mergeWithDefaults()
+    // cannot inject the default `false` and make the UI flag look explicitly set.
     let uiExplicit = null;
     try {
       const raw = await exportSettings();
@@ -43,8 +51,8 @@ async function getObservabilityConfig() {
 
     const envRaw = process.env.OBSERVABILITY_ENABLED;
     let enabled;
-    if (uiExplicit !== null) enabled = uiExplicit;
-    else if (envRaw !== undefined) enabled = envRaw.toLowerCase() === "true";
+    if (envRaw !== undefined) enabled = envRaw.toLowerCase() === "true";
+    else if (uiExplicit !== null) enabled = uiExplicit;
     else enabled = false;
 
     cachedConfig = {
