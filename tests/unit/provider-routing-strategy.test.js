@@ -54,6 +54,7 @@ vi.mock("@/sse/services/antigravityQuota.js", () => ({ getAntigravityQuotaCache:
 vi.mock("@/sse/utils/logger.js", () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
 
 let getProviderCredentials;
+let routingStateStore;
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -62,6 +63,8 @@ beforeEach(async () => {
   mocks.state.snapshots = new Map();
   vi.resetModules();
   ({ getProviderCredentials } = await import("@/sse/services/auth.js"));
+  ({ routingStateStore } = await import("open-sse/services/routingStateStore.js"));
+  routingStateStore._resetAll();
 });
 
 function seed(conns) {
@@ -104,6 +107,25 @@ describe("provider-connection routing strategies (shared engine)", () => {
       { id: "c1", priority: 1, lastSuccessAt: new Date(now - 60000).toISOString() },
       { id: "c2", priority: 2, lastSuccessAt: new Date(now - 1000).toISOString() },
     ]);
+    mocks.state.settings = { providerStrategies: { prov: { fallbackStrategy: "lkgp" } } };
+    const creds = await getProviderCredentials("prov");
+    expect(creds.connectionId).toBe("c2");
+  });
+
+  it("lkgp uses store-backed lastSuccessAt (live stats), not raw connection fields", async () => {
+    const now = Date.now();
+    // Raw DB fields say c1 succeeded most recently...
+    seed([
+      { id: "c1", priority: 1, lastSuccessAt: new Date(now - 1000).toISOString() },
+      { id: "c2", priority: 2, lastSuccessAt: new Date(now - 60000).toISOString() },
+    ]);
+    // ...but the live store recorded a fresher success for c2.
+    routingStateStore.recordOutcome("c2", { ok: true, latencyMs: 10 });
+    routingStateStore.recordOutcome("c1", { ok: true, latencyMs: 10 });
+    // Make c2's store success strictly newer than c1's.
+    await new Promise((r) => setTimeout(r, 5));
+    routingStateStore.recordOutcome("c2", { ok: true, latencyMs: 10 });
+
     mocks.state.settings = { providerStrategies: { prov: { fallbackStrategy: "lkgp" } } };
     const creds = await getProviderCredentials("prov");
     expect(creds.connectionId).toBe("c2");

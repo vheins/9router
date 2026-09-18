@@ -3,6 +3,7 @@ import { getConnectionActiveCount } from "@/lib/usageDb.js";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { orderTargets, quotaAwareOrder, isSelectionStrategy } from "open-sse/services/routingStrategies.js";
+import { routingStateStore } from "open-sse/services/routingStateStore.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
@@ -14,9 +15,6 @@ import * as log from "../utils/logger.js";
 // state, so serializing by resolved provider id preserves correctness while
 // removing the cross-provider contention a single global mutex imposed.
 const selectionMutexes = new Map(); // providerId -> Promise
-
-// Per-provider previous head — lets the `random` strategy avoid immediate repeats.
-const lastProviderHead = new Map(); // providerId -> connectionId
 
 const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
 
@@ -56,17 +54,23 @@ function connectionsToTargets(connections, { isAntigravity, model, antigravityQu
       }
       if (snap.status === "available" && snap.remainingPct == null) quotaUnlimited = true;
     }
+    // Live outcome stats (usageCount / latency / success) feed `least-used` and
+    // `auto`. Prefer the live store, but fall back to the connection's own
+    // persisted fields so ordering is unchanged when stats are absent.
+    const st = routingStateStore.getStats(c.id);
     return {
       key: c.id,
       priority: c.priority,
       weight: c.weight,
-      usageCount: c.usageCount,
+      usageCount: st?.usageCount ?? c.usageCount,
       consecutiveUseCount: c.consecutiveUseCount,
       activeRequests: getConnectionActiveCount(c.id),
       consecutiveErrors: c.backoffLevel,
       testStatus: c.testStatus,
       lastUsedAt: c.lastUsedAt,
-      lastSuccessAt: c.lastSuccessAt,
+      lastSuccessAt: st?.lastSuccessAt ?? c.lastSuccessAt,
+      latencyMs: st?.latencyEwmaMs,
+      successRate: st && st.usageCount > 0 ? st.successCount / st.usageCount : undefined,
       quotaRemainingPct,
       resetAtMs,
       quotaUnlimited,
@@ -74,15 +78,17 @@ function connectionsToTargets(connections, { isAntigravity, model, antigravityQu
   });
 }
 
-// Most-recently-successful connection — powers the `lkgp` strategy at provider level.
-function pickLastGoodKey(connections) {
+// Most-recently-successful target — powers the `lkgp` strategy at provider level.
+// Operates on ENRICHED routing targets (not raw connections) so the store-backed
+// `lastSuccessAt` is visible; raw connections only carry the DB-persisted value.
+function pickLastGoodKey(targets) {
   let best = null;
   let bestTs = -Infinity;
-  for (const c of connections) {
-    const t = c.lastSuccessAt ? new Date(c.lastSuccessAt).getTime() : null;
-    if (Number.isFinite(t) && t > bestTs) {
-      bestTs = t;
-      best = c.id;
+  for (const t of targets) {
+    const ts = t.lastSuccessAt ? new Date(t.lastSuccessAt).getTime() : null;
+    if (Number.isFinite(ts) && ts > bestTs) {
+      bestTs = ts;
+      best = t.key;
     }
   }
   return best;
@@ -299,13 +305,13 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       const targets = connectionsToTargets(availableConnections, { isAntigravity, model, antigravityQuotaCache, quotaSnapshots });
       const ordered = orderTargets(targets, strategy, {
         rotationIndex: 0,
-        lastGoodKey: pickLastGoodKey(availableConnections),
-        lastHeadKey: lastProviderHead.get(providerId),
+        lastGoodKey: pickLastGoodKey(targets),
+        lastHeadKey: routingStateStore.getLastHead(providerId),
         quotaAware,
       });
       const chosenId = ordered[0]?.key;
       connection = availableConnections.find((c) => c.id === chosenId) || availableConnections[0];
-      lastProviderHead.set(providerId, connection.id);
+      routingStateStore.setLastHead(providerId, connection.id);
       if (strategy !== "fallback" && strategy !== "fill-first") {
         log.info("AUTH", `${provider} | ${strategy}${quotaAware ? " (quota-aware)" : ""} → ${connection.id?.slice(0, 8)} (${connection.name || connection.email || "unnamed"})`);
       }

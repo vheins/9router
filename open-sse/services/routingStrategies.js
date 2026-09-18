@@ -29,6 +29,8 @@
 //   lastUsedAt          string|number  ISO or epoch (recency/auto)
 //   lastSuccessAt       string|number  ISO or epoch (lkgp)
 
+import { routingStateStore } from "./routingStateStore.js";
+
 /** Selection strategies — order/pick targets. */
 export const SELECTION_STRATEGIES = [
   { value: "priority", label: "Priority", desc: "Strict priority tiers — lowest number first" },
@@ -353,10 +355,10 @@ function orderByStrategy(list, strategy, ctx, rng, scoringCtx) {
   }
 }
 
-// ── round-robin state (in-memory, per key) ────────────────────────────────
-// Used by combos (combo name) and, for providers, mirrored into DB by auth.js.
-// A single shared map keeps both levels consistent without extra plumbing.
-const rotationState = new Map(); // key -> { index, consecutiveUseCount }
+// ── round-robin state ────────────────────────────────────────────────────
+// State now lives in the shared routingStateStore (keyed by combo name / provider
+// id), which is periodically snapshotted to the DB by routingStatePersistence.js.
+// The engine stays pure — it just delegates to the pure in-memory store.
 
 /**
  * Resolve the round-robin start index for `key`, advancing the sticky counter.
@@ -366,22 +368,10 @@ const rotationState = new Map(); // key -> { index, consecutiveUseCount }
  * @returns {number} index to pass as ctx.rotationIndex
  */
 export function nextRoundRobinIndex(key, count, stickyLimit = 1) {
-  const n = Math.max(1, Number(count) || 1);
-  const limit = Math.max(1, Number.parseInt(stickyLimit, 10) || 1);
-  const stateKey = key || "__default__";
-  const state = rotationState.get(stateKey) || { index: 0, consecutiveUseCount: 0 };
-  const currentIndex = ((state.index % n) + n) % n;
-  const nextUseCount = (state.consecutiveUseCount || 0) + 1;
-  if (nextUseCount >= limit) {
-    rotationState.set(stateKey, { index: (currentIndex + 1) % n, consecutiveUseCount: 0 });
-  } else {
-    rotationState.set(stateKey, { index: currentIndex, consecutiveUseCount: nextUseCount });
-  }
-  return currentIndex;
+  return routingStateStore.nextRotation(key || "__default__", count, stickyLimit);
 }
 
 /** Clear round-robin state for one key, or all when omitted. */
 export function resetRotationState(key) {
-  if (key) rotationState.delete(key);
-  else rotationState.clear();
+  routingStateStore.resetRotation(key);
 }

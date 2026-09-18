@@ -8,6 +8,7 @@ import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { getPricingForModel } from "../providers/pricing.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
 import { orderTargets, nextRoundRobinIndex, resetRotationState, isSelectionStrategy } from "./routingStrategies.js";
+import { routingStateStore } from "./routingStateStore.js";
 
 // Hard capabilities = input modalities; missing one drops request data (e.g. image
 // stripped). Must be prioritized. Soft (e.g. search) only degrades a feature.
@@ -85,9 +86,6 @@ export function reorderByCapabilities(models, required) {
 
 // Rotation state now lives in the shared routing engine (routingStrategies.js),
 // keyed by combo name, so combos and provider connections share one implementation.
-
-// Last successful model per combo — powers the `lkgp` (last-known-good) strategy.
-const lastGoodModel = new Map();
 
 // Trailing run of items after the last assistant/model turn = the current user
 // turn. It may span several messages (e.g. text + image split across blocks),
@@ -201,7 +199,19 @@ function modelsToTargets(models, comboConfig = {}) {
     const cost = (Number.isFinite(inCost) || Number.isFinite(outCost))
       ? ((Number.isFinite(inCost) ? inCost : 0) + (Number.isFinite(outCost) ? outCost : 0)) / 2
       : undefined;
-    return { key: modelStr, priority: 0, weight: weights[modelStr], cost };
+    // Live outcome stats (usageCount / latency / success) feed `least-used` and
+    // `auto`. Absent stats stay undefined so the engine degrades gracefully.
+    const st = routingStateStore.getStats(modelStr);
+    return {
+      key: modelStr,
+      priority: 0,
+      weight: weights[modelStr],
+      cost,
+      usageCount: st?.usageCount,
+      latencyMs: st?.latencyEwmaMs,
+      successRate: st && st.usageCount > 0 ? st.successCount / st.usageCount : undefined,
+      lastSuccessAt: st?.lastSuccessAt,
+    };
   });
 }
 
@@ -248,8 +258,8 @@ export function getRotatedModels(models, comboName, strategy, stickyLimit = 1, c
  */
 export function resetComboRotation(comboName) {
   resetRotationState(comboName);
-  if (comboName) lastGoodModel.delete(comboName);
-  else lastGoodModel.clear();
+  if (comboName) routingStateStore.clearLastGood(comboName);
+  else routingStateStore.clearLastGood();
 }
 
 /**
@@ -289,7 +299,7 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
   // Apply rotation strategy if enabled
   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit, {
     ...comboConfig,
-    lastGoodKey: comboName ? lastGoodModel.get(comboName) : undefined,
+    lastGoodKey: comboName ? routingStateStore.getLastGood(comboName) : undefined,
   });
 
   // Auto-switch: float models that satisfy the request's required capabilities to the front.
@@ -313,12 +323,20 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
 
     try {
-      const result = await handleSingleModel(body, modelStr);
-      
+      const t0 = Date.now();
+      let result;
+      try {
+        result = await handleSingleModel(body, modelStr);
+      } catch (e) {
+        routingStateStore.recordOutcome(modelStr, { ok: false, latencyMs: Date.now() - t0 });
+        throw e;
+      }
+      routingStateStore.recordOutcome(modelStr, { ok: !!result.ok, latencyMs: Date.now() - t0 });
+
       // Success (2xx) - return response
       if (result.ok) {
         log.info("COMBO", `Model ${modelStr} succeeded`);
-        if (comboName) lastGoodModel.set(comboName, modelStr);
+        if (comboName) routingStateStore.setLastGood(comboName, modelStr);
         return result;
       }
 

@@ -124,6 +124,12 @@ async function runHeavyStartup() {
   import("@/sse/services/backgroundTokenRefresh.js")
     .then(({ startBackgroundTokenRefresh }) => startBackgroundTokenRefresh())
     .catch((e) => console.log("[BackgroundTokenRefresh] scheduler start failed:", e.message));
+
+  // Redis-style write-behind persistence for the in-memory routing state:
+  // rehydrate on boot, snapshot to the DB periodically (NOT per request).
+  import("@/shared/services/routingStatePersistence")
+    .then(({ initRoutingStatePersistence }) => initRoutingStatePersistence())
+    .catch((e) => console.log("[RoutingState] persistence init failed:", e.message));
 }
 
 function hasQuotaAutoPingEnabled(settings) {
