@@ -1,5 +1,20 @@
 import { NextResponse } from "next/server";
 import { getRequestDetails } from "@/lib/usageDb";
+import { getSettings } from "@/lib/localDb";
+import { verifyDashboardAuthToken } from "@/lib/auth/dashboardSession";
+
+// Extract a cookie value from the raw Cookie header. We avoid next/headers
+// cookies() here so the route is testable without a Next request store and so
+// the redaction decision never depends on ambient request context.
+function readCookie(request, name) {
+  const header = request.headers.get("cookie") || "";
+  for (const part of header.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    if (part.slice(0, idx).trim() === name) return decodeURIComponent(part.slice(idx + 1).trim());
+  }
+  return undefined;
+}
 
 /**
  * GET /api/usage/request-details
@@ -48,11 +63,26 @@ export async function GET(request) {
     
     const result = await getRequestDetails(filter);
 
-    // Redact conversation payloads: the stored details include full request
-    // bodies (user prompts, tool calls) and provider responses. Returning them
-    // wholesale lets any dashboard-authenticated user (or, if requireLogin is
-    // disabled, anyone) read every user's conversation history. Keep the
-    // metadata (model, tokens, latency, status) but drop message content.
+    // The stored details include full request bodies (user prompts, tool calls)
+    // and provider responses. Returning them wholesale would let anyone who can
+    // reach this endpoint read every user's conversation history — so only hand
+    // back the payloads to a trusted dashboard viewer. This route is behind the
+    // dashboard auth middleware; we re-check here so the guarantee does not
+    // depend on middleware ordering. "Trusted" mirrors dashboardGuard's
+    // isAuthenticated(): a valid session JWT, or requireLogin explicitly off.
+    let trusted = await verifyDashboardAuthToken(readCookie(request, "auth_token"));
+    if (!trusted) {
+      try {
+        const settings = await getSettings();
+        trusted = settings.requireLogin === false;
+      } catch {}
+    }
+
+    if (trusted) {
+      return NextResponse.json(result);
+    }
+
+    // Keep the metadata (model, tokens, latency, status) but drop message content.
     const redactedDetails = (result.details || []).map((d) => {
       const redacted = { ...d };
       for (const key of ["request", "providerRequest", "providerResponse", "response"]) {
@@ -63,7 +93,7 @@ export async function GET(request) {
       return redacted;
     });
 
-    return NextResponse.json({ ...result, details: redactedDetails });
+    return NextResponse.json({ ...result, details: redactedDetails, redacted: true });
   } catch (error) {
     console.error("[API] Failed to get request details:", error);
     return NextResponse.json(

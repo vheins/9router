@@ -98,6 +98,14 @@ export async function PATCH(request) {
       resetComboRotation();
     }
 
+    // Observability toggle: drop the request-details config cache so the new
+    // value applies on the next captured request instead of after its 5s TTL.
+    if (Object.prototype.hasOwnProperty.call(body, "enableObservability")) {
+      import("@/lib/db/repos/requestDetailsRepo.js")
+        .then(({ invalidateObservabilityConfigCache }) => invalidateObservabilityConfigCache())
+        .catch((error) => console.warn("[Observability] cache invalidation failed:", error.message));
+    }
+
     if (
       Object.prototype.hasOwnProperty.call(body, "claudeAutoPing") ||
       Object.prototype.hasOwnProperty.call(body, "codexAutoPing")

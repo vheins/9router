@@ -24,6 +24,7 @@ import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
+import { recordRequestError } from "@/lib/usageDb.js";
 
 /**
  * Handle chat completion request
@@ -243,9 +244,19 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       }
       if (excludeConnectionIds.size === 0) {
         log.warn("AUTH", `No active credentials for provider: ${provider}`);
+        recordRequestError({
+          provider, model, apiKey,
+          endpoint: clientRawRequest?.endpoint || null,
+          error: `No active credentials for provider: ${provider}`,
+        }).catch(() => {});
         return errorResponse(HTTP_STATUS.NOT_FOUND, `No active credentials for provider: ${provider}`);
       }
       log.warn("CHAT", "No more accounts available", { provider });
+      recordRequestError({
+        provider, model, apiKey,
+        endpoint: clientRawRequest?.endpoint || null,
+        error: lastError || "All accounts unavailable",
+      }).catch(() => {});
       return errorResponse(lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE, lastError || "All accounts unavailable");
     }
 

@@ -1,54 +1,74 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-// Mirror the redaction logic from src/app/api/usage/request-details/route.js
-// so we can test it in isolation.
-function redactDetails(details) {
-  return (details || []).map((d) => {
-    const redacted = { ...d };
-    for (const key of ["request", "providerRequest", "providerResponse", "response"]) {
-      if (redacted[key] !== undefined) {
-        redacted[key] = { redacted: true };
-      }
-    }
-    return redacted;
+// The route redacts conversation payloads unless the caller presents a valid
+// dashboard session (or the install explicitly runs with requireLogin=false).
+// These tests exercise the REAL route handler against a temp DB.
+const originalDataDir = process.env.DATA_DIR;
+let tempDir;
+let db;
+
+beforeAll(async () => {
+  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "9router-redact-"));
+  process.env.DATA_DIR = tempDir;
+  vi.resetModules();
+  db = await import("@/lib/db/index.js");
+  await db.initDb();
+  await db.updateSettings({ enableObservability: true, observabilityBatchSize: 1 });
+
+  await db.saveRequestDetail({
+    id: "redact-1",
+    provider: "openai",
+    model: "gpt-4",
+    status: "success",
+    tokens: { prompt_tokens: 10, completion_tokens: 5 },
+    request: { messages: [{ role: "user", content: "secret prompt" }] },
+    providerRequest: { messages: [{ role: "user", content: "secret prompt" }] },
+    providerResponse: { choices: [{ message: { content: "secret answer" } }] },
+    response: { content: "secret answer" },
   });
+  await new Promise((r) => setTimeout(r, 150));
+});
+
+afterAll(() => {
+  if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+  if (originalDataDir === undefined) delete process.env.DATA_DIR;
+  else process.env.DATA_DIR = originalDataDir;
+});
+
+async function loadRoute() {
+  return import("@/app/api/usage/request-details/route.js");
 }
 
-describe("request-details redaction", () => {
-  it("removes conversation payloads but keeps metadata", () => {
-    const details = [{
-      id: "abc",
-      provider: "opencode",
-      model: "deepseek-v4-flash-free",
-      timestamp: "2026-08-05T00:00:00Z",
-      status: "success",
-      tokens: { prompt_tokens: 10, completion_tokens: 5 },
-      request: { messages: [{ role: "user", content: "secret prompt" }] },
-      providerRequest: { messages: [{ role: "user", content: "secret prompt" }] },
-      providerResponse: { choices: [{ message: { content: "secret answer" } }] },
-      response: { content: "secret answer" },
-    }];
-    const out = redactDetails(details)[0];
-    expect(out.id).toBe("abc");
-    expect(out.provider).toBe("opencode");
-    expect(out.model).toBe("deepseek-v4-flash-free");
-    expect(out.tokens).toEqual({ prompt_tokens: 10, completion_tokens: 5 });
-    expect(out.request).toEqual({ redacted: true });
-    expect(out.providerRequest).toEqual({ redacted: true });
-    expect(out.providerResponse).toEqual({ redacted: true });
-    expect(out.response).toEqual({ redacted: true });
+describe("request-details redaction (real route)", () => {
+  it("unauthenticated caller → payloads redacted, metadata kept", async () => {
+    const { GET } = await loadRoute();
+    const res = await GET(new Request("http://localhost/api/usage/request-details?page=1&pageSize=20"));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.redacted).toBe(true);
+    const d = body.details.find((x) => x.id === "redact-1");
+    expect(d).toBeDefined();
+    expect(d.model).toBe("gpt-4");
+    expect(d.tokens).toEqual({ prompt_tokens: 10, completion_tokens: 5 });
+    expect(d.request).toEqual({ redacted: true });
+    expect(d.providerRequest).toEqual({ redacted: true });
+    expect(d.providerResponse).toEqual({ redacted: true });
+    expect(d.response).toEqual({ redacted: true });
   });
 
-  it("handles empty details", () => {
-    expect(redactDetails([])).toEqual([]);
-    expect(redactDetails(null)).toEqual([]);
-  });
-
-  it("keeps non-sensitive fields untouched", () => {
-    const details = [{ id: "x", status: "error", latency: { total: 100 } }];
-    const out = redactDetails(details)[0];
-    expect(out.id).toBe("x");
-    expect(out.status).toBe("error");
-    expect(out.latency).toEqual({ total: 100 });
+  it("requireLogin=false → payloads returned in full", async () => {
+    await db.updateSettings({ requireLogin: false });
+    const { GET } = await loadRoute();
+    const res = await GET(new Request("http://localhost/api/usage/request-details?page=1&pageSize=20"));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.redacted).toBeUndefined();
+    const d = body.details.find((x) => x.id === "redact-1");
+    expect(d.request).toEqual({ messages: [{ role: "user", content: "secret prompt" }] });
+    expect(d.response).toEqual({ content: "secret answer" });
+    await db.updateSettings({ requireLogin: true });
   });
 });

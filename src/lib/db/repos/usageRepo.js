@@ -97,6 +97,79 @@ function aggregateEntryToDay(day, entry) {
   addToCounter(day.byEndpoint, epKey, { ...vals, meta: { endpoint, rawModel: entry.model, provider: entry.provider } });
 }
 
+// Fold one raw usageHistory row into the per-user (API-key identified) aggregate.
+// Unlike byApiKey (token/cost only), byUser carries latency + success/error
+// timestamps so the User tab can render Avg TTFT / Avg Total / TPS / Last Error.
+function addUserRow(byUser, row, ctx) {
+  const { apiKeyMap, providerNodeNameMap } = ctx;
+  const tokens = row._tokens || {};
+  const promptTokens = tokens.prompt_tokens ?? row.promptTokens ?? 0;
+  const completionTokens = tokens.completion_tokens ?? row.completionTokens ?? 0;
+  const cachedTokens = tokens.cached_tokens ?? tokens.cache_read_input_tokens ?? 0;
+  const cost = row.cost || 0;
+  const provider = row.provider || "";
+  const providerDisplayName = providerNodeNameMap[provider] || provider;
+  const model = row.model || "unknown";
+  const status = (row.status || "ok").toLowerCase();
+  const isError = status === "error";
+  const ts = row.timestamp || null;
+
+  const hasKey = row.apiKey && typeof row.apiKey === "string";
+  const keyInfo = hasKey ? apiKeyMap[row.apiKey] : null;
+  const apiKeyMasked = hasKey ? maskApiKey(row.apiKey) : null;
+  const userKey = apiKeyMasked || "local-no-key";
+  const keyName = keyInfo?.name || (hasKey ? row.apiKey.slice(0, 8) + "..." : "Local (No API Key)");
+
+  if (!byUser[userKey]) {
+    byUser[userKey] = {
+      requests: 0, errorRequests: 0,
+      promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0,
+      keyName, apiKeyMasked, apiKeyKey: userKey, machineId: keyInfo?.machineId || null,
+      models: {}, lastUsed: null, lastSuccess: null, lastError: null,
+      sumTtft: 0, sumTotal: 0, latencySamples: 0,
+    };
+  }
+  const u = byUser[userKey];
+  u.requests += 1;
+  if (isError) {
+    u.errorRequests += 1;
+    if (ts && (!u.lastError || new Date(ts) > new Date(u.lastError))) u.lastError = ts;
+  } else {
+    u.promptTokens += promptTokens;
+    u.completionTokens += completionTokens;
+    u.cachedTokens += cachedTokens;
+    u.cost += cost;
+    if (ts && (!u.lastSuccess || new Date(ts) > new Date(u.lastSuccess))) u.lastSuccess = ts;
+    if (row.totalMs > 0) { u.sumTtft += row.ttftMs || 0; u.sumTotal += row.totalMs || 0; u.latencySamples += 1; }
+  }
+  if (ts && (!u.lastUsed || new Date(ts) > new Date(u.lastUsed))) u.lastUsed = ts;
+
+  const modelKey = provider ? `${model} (${provider})` : model;
+  if (!u.models[modelKey]) {
+    u.models[modelKey] = {
+      requests: 0, errorRequests: 0,
+      promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0,
+      rawModel: model, provider: providerDisplayName,
+      sumTtft: 0, sumTotal: 0, latencySamples: 0,
+      lastUsed: null, lastSuccess: null, lastError: null,
+    };
+  }
+  const m = u.models[modelKey];
+  m.requests += 1;
+  if (isError) {
+    m.errorRequests += 1;
+    if (ts && (!m.lastError || new Date(ts) > new Date(m.lastError))) m.lastError = ts;
+  } else {
+    m.promptTokens += promptTokens;
+    m.completionTokens += completionTokens;
+    m.cachedTokens += cachedTokens;
+    m.cost += cost;
+    if (ts && (!m.lastSuccess || new Date(ts) > new Date(m.lastSuccess))) m.lastSuccess = ts;
+    if (row.totalMs > 0) { m.sumTtft += row.ttftMs || 0; m.sumTotal += row.totalMs || 0; m.latencySamples += 1; }
+  }
+  if (ts && (!m.lastUsed || new Date(ts) > new Date(m.lastUsed))) m.lastUsed = ts;
+}
+
 function pushToRing(entry) {
   recentRing.items.push(entry);
   if (recentRing.items.length > RING_CAP) {
@@ -278,11 +351,12 @@ export async function saveRequestUsage(entry) {
       }
 
       await db.run(
-        `INSERT INTO usageHistory(timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, tokens, meta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO usageHistory(timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, ttftMs, totalMs, tokens, meta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           entry.timestamp, entry.provider || null, entry.model || null,
           entry.connectionId || null, entry.apiKey || null, entry.endpoint || null,
           promptTokens, completionTokens, entry.cost || 0, entry.status || "ok",
+          Math.max(0, Math.round(entry.ttftMs || 0)), Math.max(0, Math.round(entry.totalMs || 0)),
           stringifyJson(tokens), stringifyJson({}),
         ]
       );
@@ -323,13 +397,37 @@ export async function getUsageHistory(filter = {}) {
   if (filter.endDate) { conds.push("timestamp <= ?"); params.push(new Date(filter.endDate).toISOString()); }
 
   const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
-  const rows = await db.all(`SELECT timestamp, provider, model, connectionId, apiKey, endpoint, cost, status, tokens FROM usageHistory ${where} ORDER BY id ASC`, params);
+  const rows = await db.all(`SELECT timestamp, provider, model, connectionId, apiKey, endpoint, cost, status, ttftMs, totalMs, tokens FROM usageHistory ${where} ORDER BY id ASC`, params);
 
   return rows.map((r) => ({
     timestamp: r.timestamp, provider: r.provider, model: r.model,
     connectionId: r.connectionId, apiKeyMasked: maskApiKey(r.apiKey), endpoint: r.endpoint,
-    cost: r.cost, status: r.status, tokens: parseJson(r.tokens, {}),
+    cost: r.cost, status: r.status, ttftMs: r.ttftMs || 0, totalMs: r.totalMs || 0,
+    tokens: parseJson(r.tokens, {}),
   }));
+}
+
+// Record a failed request so per-user "Last Error" is populated. Only called on
+// terminal failure (all accounts exhausted); successful requests already write
+// via saveRequestUsage. Latency is unknown on error, so both are 0.
+export async function recordRequestError(entry = {}) {
+  try {
+    const db = await getAdapter();
+    const timestamp = entry.timestamp || new Date().toISOString();
+    await db.run(
+      `INSERT INTO usageHistory(timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, ttftMs, totalMs, tokens, meta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        timestamp, entry.provider || null, entry.model || null,
+        entry.connectionId || null, entry.apiKey || null, entry.endpoint || null,
+        0, 0, 0, "error",
+        0, Math.max(0, Math.round(entry.totalMs || 0)),
+        stringifyJson({}), stringifyJson({ error: entry.error ? String(entry.error).slice(0, 500) : null }),
+      ]
+    );
+    scheduleStatsEvent("update", 250);
+  } catch (e) {
+    console.error("Failed to record request error:", e);
+  }
 }
 
 async function loadDaysInRange(adapter, maxDays) {
@@ -365,7 +463,7 @@ export async function getUsageStats(period = "all") {
   let allApiKeys = [];
   try { allApiKeys = await getApiKeys(); } catch {}
   const apiKeyMap = {};
-  for (const k of allApiKeys) apiKeyMap[k.key] = { name: k.name, id: k.id, createdAt: k.createdAt };
+  for (const k of allApiKeys) apiKeyMap[k.key] = { name: k.name, id: k.id, machineId: k.machineId, createdAt: k.createdAt };
 
   // recentRequests from live history (last 100 entries enough for 20 deduped)
   const recentRows = await db.all(`SELECT timestamp, provider, model, tokens, status FROM usageHistory ORDER BY id DESC LIMIT 100`);
@@ -444,6 +542,12 @@ export async function getUsageStats(period = "all") {
 
   const useDailySummary = period !== "24h" && period !== "today";
 
+  // Per-user aggregate is built from raw usageHistory rows in BOTH branches so
+  // it can carry latency + success/error timestamps (which the pre-aggregated
+  // usageDaily counters don't store).
+  const byUser = {};
+  const userCtx = { apiKeyMap, providerNodeNameMap };
+
   if (useDailySummary) {
     const periodDays = { "7d": 7, "30d": 30, "60d": 60 };
     const maxDays = periodDays[period] || null;
@@ -509,7 +613,7 @@ export async function getUsageStats(period = "all") {
         const apiKeyMasked = maskApiKey(apiKeyVal);
         const apiKeyKey = apiKeyMasked || "local-no-key";
         if (!stats.byApiKey[akKey]) {
-          stats.byApiKey[akKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0, rawModel, provider: providerDisplayName, apiKeyMasked, keyName, apiKeyKey, lastUsed: dateKey };
+          stats.byApiKey[akKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0, rawModel, provider: providerDisplayName, apiKeyMasked, keyName, apiKeyKey, machineId: keyInfo?.machineId || null, lastUsed: dateKey };
         }
         stats.byApiKey[akKey].requests += ak.requests || 0;
         stats.byApiKey[akKey].promptTokens += ak.promptTokens || 0;
@@ -539,7 +643,7 @@ export async function getUsageStats(period = "all") {
     // Overlay precise lastUsed timestamps from history
     const overlayCutoff = maxDays ? Date.now() - maxDays * 86400000 : 0;
     const histRows = await db.all(
-      `SELECT timestamp, provider, model, connectionId, apiKey, endpoint FROM usageHistory WHERE timestamp >= ?`,
+      `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, ttftMs, totalMs, tokens FROM usageHistory WHERE timestamp >= ?`,
       [new Date(overlayCutoff).toISOString()]
     );
     for (const e of histRows) {
@@ -561,6 +665,9 @@ export async function getUsageStats(period = "all") {
       const endpoint = e.endpoint || "Unknown";
       const endpointKey = `${endpoint}|${e.model}|${e.provider || "unknown"}`;
       if (stats.byEndpoint[endpointKey] && new Date(ts) > new Date(stats.byEndpoint[endpointKey].lastUsed)) stats.byEndpoint[endpointKey].lastUsed = ts;
+
+      e._tokens = parseJson(e.tokens, {}) || {};
+      addUserRow(byUser, e, userCtx);
     }
   } else {
     // 24h / today: live history
@@ -573,12 +680,17 @@ export async function getUsageStats(period = "all") {
       cutoff = new Date(Date.now() - PERIOD_MS["24h"]).toISOString();
     }
     const filtered = await db.all(
-      `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, tokens FROM usageHistory WHERE timestamp >= ?`,
+      `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, ttftMs, totalMs, tokens FROM usageHistory WHERE timestamp >= ?`,
       [cutoff]
     );
 
     for (const r of filtered) {
       const tokens = parseJson(r.tokens, {}) || {};
+      r._tokens = tokens;
+      // Per-user aggregate counts both success + error rows.
+      addUserRow(byUser, r, userCtx);
+      // Error rows carry no tokens/cost; keep them out of the token rollups.
+      if ((r.status || "ok").toLowerCase() === "error") continue;
       const promptTokens = tokens.prompt_tokens || 0;
       const completionTokens = tokens.completion_tokens || 0;
       const cachedTokens = tokens.cached_tokens || tokens.cache_read_input_tokens || 0;
@@ -654,6 +766,32 @@ export async function getUsageStats(period = "all") {
   }
 
   stats.totalRequests = Object.values(stats.byProvider).reduce((sum, p) => sum + (p.requests || 0), 0);
+
+  // ── Usage grouped by USER (API key) ────────────────────────────────────────
+  // A "user" is identified by the API key that authenticated the request
+  // (Authorization: Bearer / x-api-key). Requests without a key are bucketed
+  // under "local-no-key". Built from raw usageHistory rows (see addUserRow) so
+  // each user/model carries latency averages + success/error timestamps.
+  for (const u of Object.values(byUser)) {
+    u.totalTokens = u.promptTokens + u.completionTokens;
+    u.avgTtftMs = u.latencySamples ? Math.round(u.sumTtft / u.latencySamples) : null;
+    u.avgTotalMs = u.latencySamples ? Math.round(u.sumTotal / u.latencySamples) : null;
+    u.tps = u.avgTotalMs ? Number((u.completionTokens / (u.avgTotalMs / 1000)).toFixed(2)) : null;
+    u.tokensPerReq = u.requests ? Math.round(u.totalTokens / u.requests) : 0;
+    u.cacheHitRate = u.promptTokens ? Number((u.cachedTokens / u.promptTokens).toFixed(4)) : 0;
+    delete u.sumTtft; delete u.sumTotal; delete u.latencySamples;
+    for (const m of Object.values(u.models)) {
+      m.totalTokens = m.promptTokens + m.completionTokens;
+      m.avgTtftMs = m.latencySamples ? Math.round(m.sumTtft / m.latencySamples) : null;
+      m.avgTotalMs = m.latencySamples ? Math.round(m.sumTotal / m.latencySamples) : null;
+      m.tps = m.avgTotalMs ? Number((m.completionTokens / (m.avgTotalMs / 1000)).toFixed(2)) : null;
+      m.tokensPerReq = m.requests ? Math.round(m.totalTokens / m.requests) : 0;
+      m.cacheHitRate = m.promptTokens ? Number((m.cachedTokens / m.promptTokens).toFixed(4)) : 0;
+      delete m.sumTtft; delete m.sumTotal; delete m.latencySamples;
+    }
+  }
+  stats.byUser = byUser;
+
   return stats;
 }
 

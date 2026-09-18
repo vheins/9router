@@ -108,6 +108,7 @@ export default function RequestDetailsTab() {
     totalPages: 0
   });
   const [loading, setLoading] = useState(false);
+  const [redacted, setRedacted] = useState(false);
   const [selectedDetail, setSelectedDetail] = useState(null);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [providers, setProviders] = useState([]);
@@ -146,6 +147,7 @@ export default function RequestDetailsTab() {
       const data = await res.json();
 
       setDetails(data.details || []);
+      setRedacted(data.redacted === true);
       setPagination(prev => ({ ...prev, ...data.pagination }));
     } catch (error) {
       console.error("Failed to fetch request details:", error);
@@ -181,6 +183,16 @@ export default function RequestDetailsTab() {
 
   return (
     <div className="flex min-w-0 flex-col gap-6">
+      {redacted && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-300/60 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+          <span className="material-symbols-outlined text-[18px]">lock</span>
+          <span>
+            Conversation payloads are hidden for this session. Sign in to the dashboard (or run with
+            <code className="mx-1 rounded bg-black/10 px-1 font-mono text-xs dark:bg-white/10">requireLogin=false</code>
+            locally) to view full request/response bodies.
+          </span>
+        </div>
+      )}
       <Card padding="md">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <div className="flex min-w-0 flex-col gap-2">

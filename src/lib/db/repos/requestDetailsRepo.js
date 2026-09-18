@@ -10,29 +10,42 @@ const CONFIG_CACHE_TTL_MS = 5000;
 let cachedConfig = null;
 let cachedConfigTs = 0;
 
+// Force the next getObservabilityConfig() call to re-read settings. Called when
+// the UI toggles observability so the change takes effect immediately instead of
+// waiting out CONFIG_CACHE_TTL_MS.
+export function invalidateObservabilityConfigCache() {
+  cachedConfig = null;
+  cachedConfigTs = 0;
+}
+
 async function getObservabilityConfig() {
   if (cachedConfig && (Date.now() - cachedConfigTs) < CONFIG_CACHE_TTL_MS) return cachedConfig;
   try {
-    const { getSettings } = await import("./settingsRepo.js");
+    const { getSettings, exportSettings } = await import("./settingsRepo.js");
     const settings = await getSettings();
-    const envRequestLogs = process.env.ENABLE_REQUEST_LOGS;
-    if (envRequestLogs !== undefined) {
-      const enabled = envRequestLogs.toLowerCase() === "true";
-      cachedConfig = {
-        enabled,
-        maxRecords: settings.observabilityMaxRecords || parseInt(process.env.OBSERVABILITY_MAX_RECORDS || String(DEFAULT_MAX_RECORDS), 10),
-        batchSize: settings.observabilityBatchSize || parseInt(process.env.OBSERVABILITY_BATCH_SIZE || String(DEFAULT_BATCH_SIZE), 10),
-        flushIntervalMs: settings.observabilityFlushIntervalMs || parseInt(process.env.OBSERVABILITY_FLUSH_INTERVAL_MS || String(DEFAULT_FLUSH_INTERVAL_MS), 10),
-        maxJsonSize: (settings.observabilityMaxJsonSize || parseInt(process.env.OBSERVABILITY_MAX_JSON_SIZE || "5", 10)) * 1024,
-      };
-      cachedConfigTs = Date.now();
-      return cachedConfig;
-    }
-    const envFallback = process.env.OBSERVABILITY_ENABLED !== "false";
-    const uiFlag = typeof settings.enableObservability === "boolean";
-    const enabled = uiFlag
-      ? settings.enableObservability
-      : envFallback;
+
+    // DB request-detail capture is gated by the UI toggle (enableObservability)
+    // or the OBSERVABILITY_ENABLED env var. NOTE: ENABLE_REQUEST_LOGS is a
+    // DIFFERENT feature — the synchronous per-chunk FILE logger in
+    // open-sse/utils/requestLogger.js — and must NOT gate this DB capture.
+    // (Conflating them silently disabled the Details tab whenever a deployment
+    // left the documented default ENABLE_REQUEST_LOGS=false in its .env.)
+    //
+    // Precedence: an explicit UI choice (persisted raw setting) wins; otherwise
+    // the OBSERVABILITY_ENABLED env var; otherwise off. We must read the RAW
+    // settings row because getSettings() merges defaults, which would make the
+    // UI flag always look "explicitly set" and permanently shadow the env var.
+    let uiExplicit = null;
+    try {
+      const raw = await exportSettings();
+      if (typeof raw?.enableObservability === "boolean") uiExplicit = raw.enableObservability;
+    } catch {}
+
+    const envRaw = process.env.OBSERVABILITY_ENABLED;
+    let enabled;
+    if (uiExplicit !== null) enabled = uiExplicit;
+    else if (envRaw !== undefined) enabled = envRaw.toLowerCase() === "true";
+    else enabled = false;
 
     cachedConfig = {
       enabled,

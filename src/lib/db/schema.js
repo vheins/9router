@@ -147,6 +147,10 @@ export const TABLES = {
       completionTokens: "INTEGER DEFAULT 0",
       cost: "REAL DEFAULT 0",
       status: "TEXT",
+      // Per-request latency (ms). ttftMs = time to first token, totalMs = wall
+      // time. Used by the per-user analytics tab (Avg TTFT / Avg Total / TPS).
+      ttftMs: "INTEGER DEFAULT 0",
+      totalMs: "INTEGER DEFAULT 0",
       tokens: "TEXT",
       meta: "TEXT",
     },
