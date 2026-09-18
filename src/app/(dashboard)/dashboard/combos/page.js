@@ -5,7 +5,7 @@ import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, us
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { restrictToVerticalAxis, restrictToParentElement } from "@dnd-kit/modifiers";
-import { Card, Button, Modal, Input, CardSkeleton, ModelSelectModal, ConfirmModal, CapacityBadges, Select, Toggle } from "@/shared/components";
+import { Card, Button, Modal, Input, CardSkeleton, ModelSelectModal, ConfirmModal, CapacityBadges, Toggle } from "@/shared/components";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { useModelCaps } from "@/shared/hooks/useModelCaps";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
@@ -312,85 +312,16 @@ function ComboCard({ combo, getCaps, activeProviders = [], copied, onCopy, onEdi
 
   return (
     <Card padding="sm" className="group h-full">
-      <div className="flex h-full min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex min-w-0 flex-1 items-start gap-3 sm:items-center">
-          <div className="size-8 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
-            <span className="material-symbols-outlined text-primary text-[18px]">layers</span>
-          </div>
-          <div className="min-w-0 flex-1">
-            <code className="block truncate font-mono text-sm font-medium">{combo.name}</code>
-            <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
-              {combo.models.length === 0 ? (
-                <span className="text-xs text-text-muted italic">No models</span>
-              ) : (
-                combo.models.slice(0, 3).map((model, index) => (
-                  <code key={index} className="inline-flex items-center gap-1 rounded bg-black/5 px-1.5 py-0.5 font-mono text-xs text-text-muted dark:bg-white/5">
-                    <span>{model}</span>
-                    <CapacityBadges caps={getCaps?.(model)} />
-                  </code>
-                ))
-              )}
-              {combo.models.length > 3 && (
-                <span className="text-[10px] text-text-muted">+{combo.models.length - 3} more</span>
-              )}
+      <div className="flex flex-col h-full">
+
+        {/* ZONE 1 — Header */}
+        <div className="flex items-center justify-between pb-3 border-b border-border-subtle">
+          <div className="flex min-w-0 flex-1 items-center gap-3">
+            <div className="size-8 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
+              <span className="material-symbols-outlined text-primary text-[18px]">layers</span>
             </div>
-            {/* Fusion: judge picker (Auto = first model) */}
-            {isFusion && (
-              <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
-                <span className="text-[11px] font-medium text-text-muted">Judge</span>
-                <button
-                  onClick={() => setShowJudgeSelect(true)}
-                  className="inline-flex max-w-full items-center gap-1 rounded border border-dashed border-primary/40 px-1.5 py-0.5 font-mono text-[11px] text-primary hover:border-primary hover:bg-primary/5 transition-colors"
-                  title="Pick the model that fuses panel answers"
-                >
-                  <span className="material-symbols-outlined text-[13px]">gavel</span>
-                  <span className="truncate">{judge || `Auto — ${combo.models[0] || "first model"}`}</span>
-                </button>
-                {judge && (
-                  <button
-                    onClick={() => onSetStrategy({ judgeModel: "" })}
-                    className="p-0.5 rounded text-text-muted hover:text-red-500 hover:bg-red-500/10 transition-colors"
-                    title="Reset judge to Auto"
-                  >
-                    <span className="material-symbols-outlined text-[13px]">close</span>
-                  </button>
-                )}
-              </div>
-            )}
-            {/* Weighted: per-model weight editor */}
-            {isWeighted && combo.models.length > 0 && (
-              <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
-                <span className="text-[11px] font-medium text-text-muted">Weights</span>
-                {combo.models.map((model) => (
-                  <label key={model} className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 font-mono text-[11px] text-text-muted" title={model}>
-                    <span className="max-w-[140px] truncate">{model}</span>
-                    <input
-                      type="number"
-                      min={0}
-                      step={1}
-                      value={weights[model] ?? 1}
-                      onChange={(e) => onSetStrategy({ modelWeights: { ...weights, [model]: Number(e.target.value) || 0 } })}
-                      className="w-12 bg-transparent text-right focus:outline-none"
-                    />
-                  </label>
-                ))}
-              </div>
-            )}
+            <code className="block truncate font-mono text-sm font-medium">{combo.name}</code>
           </div>
-        </div>
-
-        {/* Actions */}
-        <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center sm:gap-3 sm:shrink-0">
-          {/* Strategy selector — always visible */}
-          <div className="w-full sm:w-[200px]">
-            <Select
-              options={STRATEGY_OPTIONS}
-              value={current}
-              onChange={(e) => onSetStrategy({ fallbackStrategy: e.target.value })}
-              selectClassName="py-1.5 text-xs"
-            />
-          </div>
-
           <div className="grid grid-cols-3 gap-1 sm:flex">
             <button
               onClick={(e) => { e.stopPropagation(); onCopy(combo.name, `combo-${combo.id}`); }}
@@ -420,6 +351,105 @@ function ComboCard({ combo, getCaps, activeProviders = [], copied, onCopy, onEdi
             </button>
           </div>
         </div>
+
+        {/* ZONE 2 — Body (flex-1 so it fills remaining height) */}
+        <div className="flex-1 py-3">
+            <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
+              {combo.models.length === 0 ? (
+                <span className="text-xs text-text-muted italic">No models</span>
+              ) : (
+                (() => {
+                  const visible = combo.models.slice(0, 3);
+                  const overflow = combo.models.length - visible.length;
+                  return (
+                    <div className="flex flex-wrap items-center gap-1">
+                      {visible.map((m, i) => (
+                        <span key={`${m}-${i}`} className="inline-flex items-center gap-1">
+                          {i > 0 && (
+                            <span className="select-none text-xs text-text-muted/50">→</span>
+                          )}
+                          <span className="inline-flex items-center gap-1 rounded-lg bg-black/5 dark:bg-white/5 px-2 py-1 font-mono text-xs text-text-muted">
+                            <span className="truncate max-w-[120px]">{m}</span>
+                            <CapacityBadges caps={getCaps?.(m)} />
+                          </span>
+                        </span>
+                      ))}
+                      {overflow > 0 && (
+                        <span className="inline-flex items-center rounded-lg bg-black/5 dark:bg-white/5 px-2 py-1 text-xs text-text-muted">
+                          +{overflow} more
+                        </span>
+                      )}
+                    </div>
+                  );
+                })()
+              )}
+            </div>
+            {/* Weighted: per-model weight editor */}
+            {isWeighted && combo.models.length > 0 && (
+              <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
+                <span className="text-[11px] font-medium text-text-muted">Weights</span>
+                {combo.models.map((model) => (
+                  <label key={model} className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 font-mono text-[11px] text-text-muted" title={model}>
+                    <span className="max-w-[140px] truncate">{model}</span>
+                    <input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={weights[model] ?? 1}
+                      onChange={(e) => onSetStrategy({ modelWeights: { ...weights, [model]: Number(e.target.value) || 0 } })}
+                      className="w-12 bg-transparent text-right focus:outline-none"
+                    />
+                  </label>
+                ))}
+              </div>
+            )}
+        </div>
+
+        {/* ZONE 3 — Footer */}
+        <div className="pt-3 border-t border-border-subtle">
+          {/* Strategy selector — always visible */}
+          <div className="flex flex-wrap gap-1 rounded-[10px] bg-surface-2 p-0.5">
+            {STRATEGY_OPTIONS.map((s) => (
+              <button
+                key={s.value}
+                type="button"
+                onClick={() => onSetStrategy({ fallbackStrategy: s.value })}
+                aria-pressed={current === s.value}
+                title={s.label}
+                className={`px-2.5 py-1 rounded-[8px] text-xs font-medium transition-all
+                  ${current === s.value
+                    ? 'bg-surface shadow-sm text-text-main'
+                    : 'text-text-muted hover:text-text-main'}`}
+              >
+                {s.label.split(" — ")[0]}
+              </button>
+            ))}
+          </div>
+            {/* Fusion: judge picker (Auto = first model) */}
+            {isFusion && (
+              <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
+                <span className="text-[11px] font-medium text-text-muted">Judge</span>
+                <button
+                  onClick={() => setShowJudgeSelect(true)}
+                  className="inline-flex max-w-full items-center gap-1 rounded border border-dashed border-primary/40 px-1.5 py-0.5 font-mono text-[11px] text-primary hover:border-primary hover:bg-primary/5 transition-colors"
+                  title="Pick the model that fuses panel answers"
+                >
+                  <span className="material-symbols-outlined text-[13px]">gavel</span>
+                  <span className="truncate">{judge || `Auto — ${combo.models[0] || "first model"}`}</span>
+                </button>
+                {judge && (
+                  <button
+                    onClick={() => onSetStrategy({ judgeModel: "" })}
+                    className="p-0.5 rounded text-text-muted hover:text-red-500 hover:bg-red-500/10 transition-colors"
+                    title="Reset judge to Auto"
+                  >
+                    <span className="material-symbols-outlined text-[13px]">close</span>
+                  </button>
+                )}
+              </div>
+            )}
+        </div>
+
       </div>
 
       {/* Judge model picker (single-select; combo members make natural judges too) */}
