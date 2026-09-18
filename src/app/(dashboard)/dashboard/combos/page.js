@@ -232,7 +232,7 @@ export default function CombosPage() {
           </div>
         </Card>
       ) : (
-        <div className="flex flex-col gap-4">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {combos.map((combo) => (
             <ComboCard
               key={combo.id}
@@ -311,8 +311,8 @@ function ComboCard({ combo, getCaps, activeProviders = [], copied, onCopy, onEdi
   const weights = strategy.modelWeights || {};
 
   return (
-    <Card padding="sm" className="group">
-      <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+    <Card padding="sm" className="group h-full">
+      <div className="flex h-full min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex min-w-0 flex-1 items-start gap-3 sm:items-center">
           <div className="size-8 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
             <span className="material-symbols-outlined text-primary text-[18px]">layers</span>
