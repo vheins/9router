@@ -191,3 +191,73 @@ describe("routingStrategies — purity", () => {
     expect(orderTargets([], "auto")).toEqual([]);
   });
 });
+
+describe("routingStrategies — quota-aware ordering", () => {
+  const now = Date.now();
+
+  it("sinks depleted targets below available ones (fallback)", () => {
+    const out = orderTargets([
+      T("depleted", { quotaRemainingPct: 0 }),
+      T("healthy", { quotaRemainingPct: 90 }),
+    ], "fallback", { quotaAware: true, nowMs: now });
+    expect(out.map((t) => t.key)).toEqual(["healthy", "depleted"]);
+  });
+
+  it("keeps the caller order when quotaAware is off", () => {
+    const out = orderTargets([
+      T("depleted", { quotaRemainingPct: 0 }),
+      T("healthy", { quotaRemainingPct: 90 }),
+    ], "fill-first");
+    expect(out.map((t) => t.key)).toEqual(["depleted", "healthy"]);
+  });
+
+  it("treats a past resetAt as refilled (not depleted)", () => {
+    const out = orderTargets([
+      T("refilled", { quotaRemainingPct: 0, resetAtMs: now - 60000 }),
+      T("healthy", { quotaRemainingPct: 90 }),
+    ], "fallback", { quotaAware: true, nowMs: now });
+    // refilled is no longer depleted → order preserved
+    expect(out.map((t) => t.key)).toEqual(["refilled", "healthy"]);
+  });
+
+  it("a future resetAt keeps a depleted target sunk", () => {
+    const out = orderTargets([
+      T("depleted", { quotaRemainingPct: 0, resetAtMs: now + 600000 }),
+      T("healthy", { quotaRemainingPct: 90 }),
+    ], "fallback", { quotaAware: true, nowMs: now });
+    expect(out.map((t) => t.key)).toEqual(["healthy", "depleted"]);
+  });
+
+  it("quotaUnlimited is never treated as depleted", () => {
+    const out = orderTargets([
+      T("unlimited", { quotaUnlimited: true, quotaRemainingPct: 0 }),
+      T("healthy", { quotaRemainingPct: 90 }),
+    ], "fallback", { quotaAware: true, nowMs: now });
+    expect(out.map((t) => t.key)).toEqual(["unlimited", "healthy"]);
+  });
+
+  it("unknown quota (undefined) is not depleted", () => {
+    const out = orderTargets([
+      T("unknown"),
+      T("healthy", { quotaRemainingPct: 90 }),
+    ], "fallback", { quotaAware: true, nowMs: now });
+    expect(out.map((t) => t.key)).toEqual(["unknown", "healthy"]);
+  });
+
+  it("lkgp does not stick to a depleted last-known-good", () => {
+    const out = orderTargets([
+      T("lkg", { quotaRemainingPct: 0, resetAtMs: now + 600000 }),
+      T("healthy", { quotaRemainingPct: 90 }),
+    ], "lkgp", { quotaAware: true, lastGoodKey: "lkg", nowMs: now });
+    expect(out[0].key).toBe("healthy");
+  });
+
+  it("only applies to quota-aware strategies (weighted unaffected)", () => {
+    const out = orderTargets([
+      T("depleted", { quotaRemainingPct: 0, weight: 100 }),
+      T("healthy", { quotaRemainingPct: 90, weight: 1 }),
+    ], "weighted", { quotaAware: true, nowMs: now, rng: () => 0 });
+    // weighted ignores quota; rng()=0 picks the first pool entry by weight order
+    expect(out).toHaveLength(2);
+  });
+});

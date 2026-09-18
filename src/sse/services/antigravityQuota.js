@@ -6,6 +6,7 @@
 
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { getAntigravityUsage } from "open-sse/services/usage/google.js";
+import { persistQuotaSnapshot } from "@/shared/quota/persistQuota.js";
 import * as log from "../utils/logger.js";
 
 // In-memory cache: connectionId → { [modelId]: { remainingPercentage, resetAt } }
@@ -122,6 +123,10 @@ async function _doRefresh(connectionId, accessToken, providerSpecificData, now) 
     // Strike blocks are re-asserted after every refresh so an optimistic
     // upstream reading cannot resurrect a pair we just circuit-broke.
     quotaCache.set(connectionId, applyActiveStrikeBlocks(connectionId, usage.quotas));
+
+    // Persist a durable snapshot (FORK-ONLY quotaTracker) so routing survives a
+    // restart. Fire-and-forget: never add latency to the refresh path.
+    persistQuotaSnapshot(connectionId, "antigravity", usage).catch(() => {});
 
     return usage.quotas;
   } catch (e) {

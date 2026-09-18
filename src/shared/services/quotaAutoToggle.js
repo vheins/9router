@@ -9,6 +9,7 @@ import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { refreshAndUpdateCredentials } from "@/app/api/usage/[connectionId]/route.js";
 import { USAGE_SUPPORTED_PROVIDERS, USAGE_APIKEY_PROVIDERS } from "@/shared/constants/providers";
 import { classifyUsage, QUOTA_STATUS } from "@/shared/quota/availability.js";
+import { persistQuotaSnapshot } from "@/shared/quota/persistQuota.js";
 import { QUOTA_AUTO_TOGGLE_CONFIG } from "@/shared/constants/config";
 
 const C = QUOTA_AUTO_TOGGLE_CONFIG;
@@ -70,6 +71,11 @@ async function evaluateConnection(conn, deps, state) {
 
   const usage = await deps.getUsageForProvider(connection, proxyOptions, { force: false });
   const status = classifyUsage(conn.provider, usage);
+
+  // Persist the snapshot (even when UNKNOWN — a null-measurable payload simply
+  // returns null and writes nothing) so routing has durable quota state.
+  await (deps.persistQuotaSnapshot || persistQuotaSnapshot)(conn.id, conn.provider, usage);
+
   if (status === QUOTA_STATUS.UNKNOWN) return;
 
   const currentActive = conn.isActive !== false;
@@ -158,5 +164,6 @@ function createDefaultDeps() {
     resolveConnectionProxyConfig,
     refreshAndUpdateCredentials,
     getUsageForProvider,
+    persistQuotaSnapshot,
   };
 }

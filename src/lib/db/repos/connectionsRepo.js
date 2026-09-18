@@ -235,6 +235,8 @@ export async function deleteProviderConnection(id) {
     const row = await db.get(`SELECT provider FROM providerConnections WHERE id = ?`, [id]);
     if (!row) return;
     await db.run(`DELETE FROM providerConnections WHERE id = ?`, [id]);
+    // Drop the persisted quota snapshot too (FORK-ONLY table).
+    await db.run(`DELETE FROM quotaTracker WHERE connectionId = ?`, [id]);
     await reorderInTx(db, row.provider);
     ok = true;
   });
@@ -245,6 +247,8 @@ export async function deleteProviderConnectionsByProvider(providerId) {
   const db = await getAdapter();
   const before = await db.get(`SELECT COUNT(*) AS n FROM providerConnections WHERE provider = ?`, [providerId]);
   await db.run(`DELETE FROM providerConnections WHERE provider = ?`, [providerId]);
+  // Drop persisted quota snapshots for this provider too (FORK-ONLY table).
+  await db.run(`DELETE FROM quotaTracker WHERE provider = ?`, [providerId]);
   return before?.n || 0;
 }
 

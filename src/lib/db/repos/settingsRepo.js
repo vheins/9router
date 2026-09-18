@@ -15,6 +15,10 @@ const DEFAULT_SETTINGS = {
   providerStrategies: {},
   quotaVisibility: {},
   quotaAutoToggleEnabled: true,
+  // Quota-aware routing: when true, fallback/fill-first demote accounts whose
+  // persisted quota snapshot shows an empty window, so a funded account is tried
+  // first. Overridable per provider via providerStrategies[pid].quotaAware.
+  quotaAwareRouting: true,
   comboStrategy: "fallback",
   comboStickyRoundRobinLimit: 1,
   comboStrategies: {},

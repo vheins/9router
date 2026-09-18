@@ -50,3 +50,45 @@ export function classifyUsage(provider, usage) {
   }
   return classifyQuotaRows(rows);
 }
+
+// Build a persisted quota snapshot from a raw usage payload.
+// `remainingPct` = the LOWEST remaining % across measurable windows (the binding
+// constraint — what actually gates the account). `resetAt` = the earliest future
+// reset among depleted windows (when the account will become usable again).
+// Returns null when the payload yields no measurable rows (nothing to persist).
+export function buildQuotaSnapshot(provider, usage) {
+  if (!usage || typeof usage !== "object") return null;
+  if (usage.message && !usage.quotas) return null;
+  let rows;
+  try {
+    rows = parseQuotaData(provider, usage);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+
+  const measurable = rows.filter((q) => q && Number(q.total) > 0);
+  // Nothing measurable → UNKNOWN, nothing useful to persist.
+  if (measurable.length === 0) return null;
+  const status = classifyQuotaRows(rows);
+
+  let remainingPct = null;
+  for (const q of measurable) {
+    if (q.unlimited === true) continue;
+    const pct = getRemainingPercentage(q);
+    if (!Number.isFinite(pct)) continue;
+    if (remainingPct === null || pct < remainingPct) remainingPct = pct;
+  }
+
+  // Earliest future reset among depleted windows — when quota comes back.
+  const now = Date.now();
+  let resetAt = null;
+  for (const q of rows) {
+    if (!isQuotaRowDepleted(q)) continue;
+    const t = q?.resetAt ? new Date(q.resetAt).getTime() : NaN;
+    if (!Number.isFinite(t) || t <= now) continue;
+    if (resetAt === null || t < new Date(resetAt).getTime()) resetAt = new Date(t).toISOString();
+  }
+
+  return { provider, status, remainingPct, resetAt, quotas: rows };
+}

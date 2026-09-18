@@ -9,6 +9,7 @@ import { CLAUDE_CLI_SPOOF_HEADERS } from "open-sse/providers/shared.js";
 import { proxyAwareFetch } from "open-sse/utils/proxyFetch.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { refreshAndUpdateCredentials } from "@/app/api/usage/[connectionId]/route.js";
+import { persistQuotaSnapshot } from "@/shared/quota/persistQuota.js";
 import { QUOTA_AUTOPING_CONFIG } from "@/shared/constants/config";
 
 const C = QUOTA_AUTOPING_CONFIG;
@@ -210,6 +211,11 @@ async function pingConnection(conn, provider, providerConfig, handler, deps, sta
 
   const usage = await handler.getUsage(connection.accessToken, proxyOptions);
   const quotas = usage?.quotas || {};
+
+  // Persist a durable quota snapshot (FORK-ONLY) so routing can consult it even
+  // on a cold boot. Fail-open.
+  await (deps.persistQuotaSnapshot || persistQuotaSnapshot)(connection.id, provider, usage);
+
   const quota = quotas?.[providerConfig.quotaKey];
   const resetAt = quota?.resetAt;
   if (!resetAt) return;
@@ -255,6 +261,7 @@ function createDefaultDeps() {
     refreshAndUpdateCredentials,
     proxyAwareFetch,
     getExecutor,
+    persistQuotaSnapshot,
   };
 }
 

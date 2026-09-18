@@ -103,6 +103,60 @@ describe("quota availability classification", () => {
   });
 });
 
+describe("buildQuotaSnapshot", () => {
+  let buildQuotaSnapshot;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    ({ buildQuotaSnapshot } = await import("../../src/shared/quota/availability.js"));
+  });
+
+  it("uses the lowest remaining % as the binding constraint", () => {
+    const snap = buildQuotaSnapshot("codex", {
+      quotas: {
+        session: { used: 10, total: 100 },       // 90% left
+        weekly: { used: 80, total: 100 },        // 20% left
+      },
+    });
+    expect(snap.status).toBe("available");
+    expect(snap.remainingPct).toBe(20);
+  });
+
+  it("captures the earliest future reset among depleted windows", () => {
+    const soon = new Date(Date.now() + 60000).toISOString();
+    const later = new Date(Date.now() + 600000).toISOString();
+    const snap = buildQuotaSnapshot("codex", {
+      quotas: {
+        session: { used: 100, total: 100, resetAt: later },
+        weekly: { used: 100, total: 100, resetAt: soon },
+      },
+    });
+    expect(snap.status).toBe("empty");
+    expect(snap.remainingPct).toBe(0);
+    expect(snap.resetAt).toBe(soon);
+  });
+
+  it("returns null for a soft-error envelope (message, no quotas)", () => {
+    expect(buildQuotaSnapshot("codex", { message: "Usage API temporarily unavailable (500)." })).toBeNull();
+  });
+
+  it("returns null when there are no measurable rows", () => {
+    expect(buildQuotaSnapshot("claude", { quotas: { "session (5h)": { used: 0, total: 0 } } })).toBeNull();
+    expect(buildQuotaSnapshot("claude", null)).toBeNull();
+  });
+
+  it("ignores unlimited windows when computing remainingPct", () => {
+    // `zed` forwards the unlimited flag (claude/codex parsers do not).
+    const snap = buildQuotaSnapshot("zed", {
+      quotas: {
+        predictions: { used: 100, total: 100, unlimited: true },
+        hosted: { used: 50, total: 100 },
+      },
+    });
+    expect(snap.remainingPct).toBe(50);
+  });
+});
+
 describe("quota auto-toggle", () => {
   let runQuotaAutoToggleTick;
   let configureQuotaAutoToggle;

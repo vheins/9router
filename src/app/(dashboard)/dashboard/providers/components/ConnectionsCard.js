@@ -318,6 +318,7 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
   const [selectedConnection, setSelectedConnection] = useState(null);
   const [providerStrategy, setProviderStrategy] = useState(null);
   const [providerStickyLimit, setProviderStickyLimit] = useState("1");
+  const [providerQuotaAware, setProviderQuotaAware] = useState(false);
   const [confirmState, setConfirmState] = useState(null);
 
   const fetch_ = useCallback(async () => {
@@ -335,6 +336,7 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
       const override = (settingsData.providerStrategies || {})[providerId] || {};
       setProviderStrategy(override.fallbackStrategy || null);
       setProviderStickyLimit(override.stickyRoundRobinLimit != null ? String(override.stickyRoundRobinLimit) : "1");
+      setProviderQuotaAware(override.quotaAware === true);
     } catch (e) { console.log("ConnectionsCard fetch error:", e); }
     finally { setLoading(false); }
   }, [providerId]);
@@ -354,6 +356,24 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
       else updated[providerId] = override;
       await fetch("/api/settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ providerStrategies: updated }) });
     } catch (e) { console.log("saveStrategy error:", e); }
+  };
+
+  // Partial merge: preserve other override keys (e.g. quotaAware) when the
+  // caller only changes one field.
+  const patchProviderOverride = async (patch) => {
+    try {
+      const res = await fetch("/api/settings", { cache: "no-store" });
+      const data = res.ok ? await res.json() : {};
+      const current = data.providerStrategies || {};
+      const next = { ...(current[providerId] || {}), ...patch };
+      for (const k of Object.keys(next)) {
+        if (next[k] === null || next[k] === undefined || next[k] === "") delete next[k];
+      }
+      const updated = { ...current };
+      if (Object.keys(next).length === 0) delete updated[providerId];
+      else updated[providerId] = next;
+      await fetch("/api/settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ providerStrategies: updated }) });
+    } catch (e) { console.log("patchProviderOverride error:", e); }
   };
 
   const handleSwapPriority = async (i1, i2) => {
@@ -442,6 +462,14 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
                 />
               </div>
             )}
+            <label className="flex items-center gap-1.5" title="Deprioritize accounts whose Quota Tracker snapshot shows depleted quota">
+              <span className="text-xs text-text-muted font-medium">Quota-aware</span>
+              <Toggle
+                size="sm"
+                checked={providerQuotaAware}
+                onChange={(enabled) => { setProviderQuotaAware(enabled); patchProviderOverride({ quotaAware: enabled ? true : null }); }}
+              />
+            </label>
           </div>
         </div>
 

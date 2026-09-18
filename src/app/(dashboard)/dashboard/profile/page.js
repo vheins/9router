@@ -310,6 +310,21 @@ export default function ProfilePage() {
     }
   };
 
+  const updateQuotaAwareRouting = async (enabled) => {
+    try {
+      const res = await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ quotaAwareRouting: enabled }),
+      });
+      if (res.ok) {
+        setSettings(prev => ({ ...prev, quotaAwareRouting: enabled }));
+      }
+    } catch (err) {
+      console.error("Failed to update quota-aware routing:", err);
+    }
+  };
+
   const updateComboStickyLimit = async (limit) => {
     const numLimit = parseInt(limit);
     if (isNaN(numLimit) || numLimit < 1) return;
@@ -1533,6 +1548,21 @@ export default function ProfilePage() {
                 />
               </div>
             )}
+
+            {/* Quota-aware routing */}
+            <div className="flex items-start sm:items-center justify-between gap-4 pt-4 border-t border-border/50">
+              <div className="flex-1 min-w-0">
+                <p className="font-medium text-sm sm:text-base">Quota-aware Routing</p>
+                <p className="text-xs sm:text-sm text-text-muted">
+                  Deprioritize accounts whose Quota Tracker snapshot shows depleted quota before trying them
+                </p>
+              </div>
+              <Toggle
+                checked={settings.quotaAwareRouting !== false}
+                onChange={() => updateQuotaAwareRouting(settings.quotaAwareRouting === false)}
+                disabled={loading}
+              />
+            </div>
 
             <p className="text-xs text-text-muted italic pt-2 border-t border-border/50">
               {settings.fallbackStrategy === "round-robin"

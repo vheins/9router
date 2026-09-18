@@ -1,8 +1,8 @@
-import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
+import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools, getQuotaSnapshots } from "@/lib/localDb";
 import { getConnectionActiveCount } from "@/lib/usageDb.js";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
-import { orderTargets, isSelectionStrategy } from "open-sse/services/routingStrategies.js";
+import { orderTargets, quotaAwareOrder, isSelectionStrategy } from "open-sse/services/routingStrategies.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
@@ -29,16 +29,32 @@ function githubMonthlyResetMs(status, errorText, provider) {
 
 // Build routing-engine targets from available connections. Missing fields stay
 // undefined so the engine degrades gracefully (keeps the caller's order).
-function connectionsToTargets(connections, { isAntigravity, model, antigravityQuotaCache }) {
+// `quotaSnapshots` is an optional Map<connectionId, persistedSnapshot> from the
+// FORK-ONLY quotaTracker table — its values fill in quotaRemainingPct/resetAtMs
+// for any connection the in-memory Antigravity cache doesn't cover.
+function connectionsToTargets(connections, { isAntigravity, model, antigravityQuotaCache, quotaSnapshots }) {
   return connections.map((c) => {
     let quotaRemainingPct;
     let resetAtMs;
+    let quotaUnlimited = false;
     if (isAntigravity && model && antigravityQuotaCache) {
       const quota = antigravityQuotaCache.get(c.id)?.[model];
       if (quota) {
         quotaRemainingPct = quota.remainingPercentage;
         resetAtMs = quota.resetAt ? new Date(quota.resetAt).getTime() : undefined;
       }
+    }
+    // Persisted snapshot (fallback source of truth when the in-memory cache is cold).
+    const snap = quotaSnapshots?.get(c.id);
+    if (snap) {
+      if (quotaRemainingPct === undefined && Number.isFinite(snap.remainingPct)) {
+        quotaRemainingPct = snap.remainingPct;
+      }
+      if (resetAtMs === undefined && snap.resetAt) {
+        const t = new Date(snap.resetAt).getTime();
+        if (Number.isFinite(t)) resetAtMs = t;
+      }
+      if (snap.status === "available" && snap.remainingPct == null) quotaUnlimited = true;
     }
     return {
       key: c.id,
@@ -53,6 +69,7 @@ function connectionsToTargets(connections, { isAntigravity, model, antigravityQu
       lastSuccessAt: c.lastSuccessAt,
       quotaRemainingPct,
       resetAtMs,
+      quotaUnlimited,
     };
   });
 }
@@ -197,6 +214,21 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const providerOverride = (settings.providerStrategies || {})[providerId] || {};
     const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
 
+    // Quota-aware routing: demote exhausted accounts so fallback tries a funded
+    // account first. Enabled globally (settings.quotaAwareRouting) and overridable
+    // per provider (providerStrategies[pid].quotaAware). Persisted snapshots from
+    // the quotaTracker table are the source of truth; Antigravity's in-memory cache
+    // takes precedence when warm.
+    const quotaAware = providerOverride.quotaAware ?? settings.quotaAwareRouting ?? false;
+    let quotaSnapshots = null;
+    if (quotaAware) {
+      try {
+        quotaSnapshots = await getQuotaSnapshots(availableConnections.map((c) => c.id));
+      } catch (e) {
+        log.debug("AUTH", `${provider} | quota snapshot read failed (continuing): ${e?.message ?? e}`);
+      }
+    }
+
     let connection;
     // Pin to preferred connection if specified and available
     if (preferredConnectionId) {
@@ -212,8 +244,19 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // Legacy sticky round-robin: persisted to DB via lastUsedAt/consecutiveUseCount.
       const stickyLimit = providerOverride.stickyRoundRobinLimit || settings.stickyRoundRobinLimit || 3;
 
+      // Quota-aware: build the candidate order from the engine (which demotes
+      // depleted accounts) so an exhausted account is only used when no funded
+      // account remains in the rotation.
+      let candidates = availableConnections;
+      if (quotaAware) {
+        const targets = connectionsToTargets(availableConnections, { isAntigravity, model, antigravityQuotaCache, quotaSnapshots });
+        const ordered = quotaAwareOrder(targets);
+        const byId = new Map(availableConnections.map((c) => [c.id, c]));
+        candidates = ordered.map((t) => byId.get(t.key)).filter(Boolean);
+      }
+
       // Sort by lastUsed (most recent first) to find current candidate
-      const byRecency = [...availableConnections].sort((a, b) => {
+      const byRecency = [...candidates].sort((a, b) => {
         if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
         if (!a.lastUsedAt) return 1;
         if (!b.lastUsedAt) return -1;
@@ -233,7 +276,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         });
       } else {
         // Pick the least recently used (excluding current if possible)
-        const sortedByOldest = [...availableConnections].sort((a, b) => {
+        const sortedByOldest = [...candidates].sort((a, b) => {
           if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
           if (!a.lastUsedAt) return -1;
           if (!b.lastUsedAt) return 1;
@@ -248,22 +291,26 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
           consecutiveUseCount: 1
         });
       }
-    } else if (isSelectionStrategy(strategy) && strategy !== "fill-first" && strategy !== "fallback") {
-      // Shared routing engine (weighted / p2c / least-used / random / cost-optimized /
-      // headroom / reset-* / lkgp / auto / priority). availableConnections is already
-      // priority-sorted, so the engine's default/unknown path preserves fill-first.
-      const targets = connectionsToTargets(availableConnections, { isAntigravity, model, antigravityQuotaCache });
+    } else if (isSelectionStrategy(strategy)) {
+      // Shared routing engine (fallback/fill-first/priority/weighted/p2c/least-used/
+      // random/cost-optimized/headroom/reset-*/lkgp/auto). availableConnections is
+      // already priority-sorted, so the engine's default path preserves fill-first.
+      // Quota-aware sinks exhausted accounts for the order-preserving strategies.
+      const targets = connectionsToTargets(availableConnections, { isAntigravity, model, antigravityQuotaCache, quotaSnapshots });
       const ordered = orderTargets(targets, strategy, {
         rotationIndex: 0,
         lastGoodKey: pickLastGoodKey(availableConnections),
         lastHeadKey: lastProviderHead.get(providerId),
+        quotaAware,
       });
       const chosenId = ordered[0]?.key;
       connection = availableConnections.find((c) => c.id === chosenId) || availableConnections[0];
       lastProviderHead.set(providerId, connection.id);
-      log.info("AUTH", `${provider} | ${strategy} → ${connection.id?.slice(0, 8)} (${connection.name || connection.email || "unnamed"})`);
+      if (strategy !== "fallback" && strategy !== "fill-first") {
+        log.info("AUTH", `${provider} | ${strategy}${quotaAware ? " (quota-aware)" : ""} → ${connection.id?.slice(0, 8)} (${connection.name || connection.email || "unnamed"})`);
+      }
     } else {
-      // Default: fill-first (already sorted by priority in getProviderConnections)
+      // Unknown strategy → fill-first (already sorted by priority in getProviderConnections)
       connection = availableConnections[0];
     }
 

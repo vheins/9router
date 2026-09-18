@@ -3,9 +3,21 @@
 // pre-change safety backup in migrate.js: when the stored version is lower,
 // one lightweight DB backup is taken before applying schema changes. Forgetting
 // to bump only skips that backup — it does NOT break the additive auto-sync.
+//
+// ⚠️ FORK NOTE: This is a fork of upstream. SCHEMA_VERSION tracks UPSTREAM's
+// linear counter and MUST stay in lockstep with upstream (do NOT bump it for
+// fork-only schema changes — a fork bump to N would collide with upstream's own
+// N and skip the pre-change backup). Fork-only schema additions (e.g. the
+// quotaTracker table) bump FORK_SCHEMA_VERSION below instead, which is compared
+// independently so upstream and fork version spaces never clash.
 import { buildCreateTableMaria } from "./dialect.js";
 
 export const SCHEMA_VERSION = 3;
+
+// Fork-only schema version. Bump by +1 for every schema change that exists ONLY
+// in this fork. Stored under a separate _meta key (backupForkSchemaVersion) and
+// OR-ed into the migrate.js backup decision alongside SCHEMA_VERSION.
+export const FORK_SCHEMA_VERSION = 1;
 
 // UUID primary keys are declared CHAR(36) — a fixed-width, binary-collated
 // string. SQLite treats CHAR as TEXT affinity (stores the same UUID string,
@@ -184,6 +196,25 @@ export const TABLES = {
       "CREATE INDEX IF NOT EXISTS idx_rd_provider ON requestDetails(provider)",
       "CREATE INDEX IF NOT EXISTS idx_rd_model ON requestDetails(model)",
       "CREATE INDEX IF NOT EXISTS idx_rd_conn ON requestDetails(connectionId)",
+    ],
+  },
+  // FORK-ONLY: persisted per-connection quota snapshots. Written by the quota
+  // auto-toggle / auto-ping schedulers and the /api/usage route; read by the
+  // routing engine's quota-aware ordering so fallback can prefer accounts with
+  // remaining quota. Survives restarts (unlike the in-memory caches).
+  quotaTracker: {
+    columns: {
+      connectionId: "VARCHAR(255) PRIMARY KEY",
+      provider: "TEXT",
+      status: "TEXT",              // "available" | "empty" | "unknown"
+      remainingPct: "REAL",        // best remaining % across measurable windows
+      resetAt: "TEXT",             // earliest reset (ISO) when empty
+      quotas: "TEXT",              // full normalized quota rows (JSON)
+      updatedAt: "TEXT NOT NULL",
+    },
+    indexes: [
+      "CREATE INDEX IF NOT EXISTS idx_qt_provider ON quotaTracker(provider)",
+      "CREATE INDEX IF NOT EXISTS idx_qt_status ON quotaTracker(status)",
     ],
   },
 };

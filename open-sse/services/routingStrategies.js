@@ -58,6 +58,11 @@ export const ALL_STRATEGIES = [...ORCHESTRATION_STRATEGIES, ...SELECTION_STRATEG
 const SELECTION_VALUES = new Set(SELECTION_STRATEGIES.map((s) => s.value));
 const ORCHESTRATION_VALUES = new Set(ORCHESTRATION_STRATEGIES.map((s) => s.value));
 
+// Strategies whose ordering is purely positional (the caller's order encodes
+// intent). Only these get the quota-aware "sink depleted targets" pass; scoring
+// and sampling strategies already factor quota into their own ranking.
+const QUOTA_AWARE_STRATEGIES = new Set(["fallback", "fill-first", "priority", "lkgp"]);
+
 /** True when `value` is a known selection strategy. `fallback` counts as fill-first. */
 export function isSelectionStrategy(value) {
   return value === "fallback" || SELECTION_VALUES.has(value);
@@ -169,6 +174,32 @@ function resetOf(t) {
   return r === null ? Number.POSITIVE_INFINITY : r;
 }
 
+// Threshold below which a target counts as "depleted" for quota-aware ordering.
+const DEPLETED_QUOTA_THRESHOLD = 5;
+
+// Is this target currently out of quota? Unknown quota is treated as available
+// (we must not starve a target just because we never measured it).
+function isDepleted(t, nowMs) {
+  if (t.quotaUnlimited) return false;
+  const q = Number(t.quotaRemainingPct);
+  if (!Number.isFinite(q)) return false;
+  if (q > DEPLETED_QUOTA_THRESHOLD) return false;
+  // If a reset time is known and already past, the window has refilled.
+  const r = ts(t.resetAtMs);
+  if (r !== null && r <= nowMs) return false;
+  return true;
+}
+
+// Quota-aware reorder: keep the caller's order but float depleted targets to the
+// end (stable partition). Used for fallback / fill-first / priority so an
+// exhausted account is only tried after every account that still has quota.
+export function quotaAwareOrder(list, nowMs = Date.now()) {
+  const available = [];
+  const depleted = [];
+  for (const t of list) (isDepleted(t, nowMs) ? depleted : available).push(t);
+  return [...available, ...depleted];
+}
+
 // reset-aware: targets that still have quota first, then soonest reset first.
 function resetAwareRank(t) {
   const hasQuota = quotaOf(t) > 0 ? 0 : 1;
@@ -242,6 +273,8 @@ function autoScore(t, ctx) {
  * @param {number} [ctx.rotationIndex=0] - round-robin start index (caller-owned)
  * @param {string} [ctx.lastGoodKey] - last-known-good key for `lkgp`
  * @param {string} [ctx.lastHeadKey] - previous head for `random` dedup
+ * @param {boolean} [ctx.quotaAware] - sink depleted targets for order-based strategies
+ * @param {number} [ctx.nowMs] - clock override for quota reset checks
  * @param {() => number} [ctx.rng] - RNG (default Math.random; injectable for tests)
  * @returns {Array<object>} a NEW ordered array (never mutates input)
  */
@@ -252,6 +285,20 @@ export function orderTargets(targets, strategy, ctx = {}) {
   const rng = typeof ctx.rng === "function" ? ctx.rng : Math.random;
   const scoringCtx = { ...ctx, _set: list };
 
+  const ordered = orderByStrategy(list, strategy, ctx, rng, scoringCtx);
+
+  // Quota-aware pass (FINAL step) applies only to order-preserving strategies —
+  // for these the strategy's order encodes intent (priority / sticky last-good),
+  // and we merely demote exhausted targets so they are tried last. Running it
+  // last also means lkgp won't stick to a depleted last-known-good account.
+  if (ctx.quotaAware === true && QUOTA_AWARE_STRATEGIES.has(strategy)) {
+    const nowMs = Number.isFinite(ctx.nowMs) ? ctx.nowMs : Date.now();
+    return quotaAwareOrder(ordered, nowMs);
+  }
+  return ordered;
+}
+
+function orderByStrategy(list, strategy, ctx, rng, scoringCtx) {
   switch (strategy) {
     case "priority":
       return sortBy(list, (t) => num(t.priority, 999));

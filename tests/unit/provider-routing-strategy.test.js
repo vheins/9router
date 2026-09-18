@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Provider-connection selection via the shared routing engine (auth.js).
 const mocks = vi.hoisted(() => {
-  const state = { connections: [], settings: {} };
+  const state = { connections: [], settings: {}, snapshots: new Map() };
   return {
     state,
     getProviderConnections: vi.fn(async (query = {}) =>
@@ -15,6 +15,11 @@ const mocks = vi.hoisted(() => {
       if (c) Object.assign(c, patch);
       return c ? { ...c } : null;
     }),
+    getQuotaSnapshots: vi.fn(async (ids = []) => {
+      const out = new Map();
+      for (const id of ids) if (state.snapshots.has(id)) out.set(id, state.snapshots.get(id));
+      return out;
+    }),
   };
 });
 
@@ -24,6 +29,7 @@ vi.mock("@/lib/localDb", () => ({
   getSettings: vi.fn(async () => mocks.state.settings),
   getProxyPools: vi.fn(async () => []),
   validateApiKey: vi.fn(async () => true),
+  getQuotaSnapshots: mocks.getQuotaSnapshots,
 }));
 vi.mock("@/lib/usageDb.js", () => ({
   getConnectionActiveCount: vi.fn(() => 0),
@@ -53,6 +59,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   mocks.state.connections = [];
   mocks.state.settings = {};
+  mocks.state.snapshots = new Map();
   vi.resetModules();
   ({ getProviderCredentials } = await import("@/sse/services/auth.js"));
 });
@@ -122,5 +129,62 @@ describe("provider-connection routing strategies (shared engine)", () => {
     const second = await getProviderCredentials("prov");
     expect(first.connectionId).not.toBe(second.connectionId);
     expect(mocks.updateProviderConnection).toHaveBeenCalled();
+  });
+
+  it("quota-aware fallback demotes an account whose persisted snapshot is depleted", async () => {
+    seed([
+      { id: "c1", priority: 1, name: "depleted" },
+      { id: "c2", priority: 2, name: "healthy" },
+    ]);
+    // c1 (higher priority) is depleted per the persisted Quota Tracker snapshot.
+    mocks.state.snapshots.set("c1", {
+      provider: "prov", status: "empty", remainingPct: 0,
+      resetAt: new Date(Date.now() + 600000).toISOString(),
+    });
+    mocks.state.settings = { quotaAwareRouting: true };
+    const creds = await getProviderCredentials("prov");
+    expect(creds.connectionId).toBe("c2");
+  });
+
+  it("quota-aware off keeps priority order even when a snapshot is depleted", async () => {
+    seed([
+      { id: "c1", priority: 1 },
+      { id: "c2", priority: 2 },
+    ]);
+    mocks.state.snapshots.set("c1", {
+      provider: "prov", status: "empty", remainingPct: 0,
+      resetAt: new Date(Date.now() + 600000).toISOString(),
+    });
+    mocks.state.settings = { quotaAwareRouting: false };
+    const creds = await getProviderCredentials("prov");
+    expect(creds.connectionId).toBe("c1");
+  });
+
+  it("per-provider quotaAware:false overrides the global default", async () => {
+    seed([
+      { id: "c1", priority: 1 },
+      { id: "c2", priority: 2 },
+    ]);
+    mocks.state.snapshots.set("c1", {
+      provider: "prov", status: "empty", remainingPct: 0,
+      resetAt: new Date(Date.now() + 600000).toISOString(),
+    });
+    mocks.state.settings = { quotaAwareRouting: true, providerStrategies: { prov: { quotaAware: false } } };
+    const creds = await getProviderCredentials("prov");
+    expect(creds.connectionId).toBe("c1");
+  });
+
+  it("a snapshot with a past resetAt is treated as refilled (no demotion)", async () => {
+    seed([
+      { id: "c1", priority: 1 },
+      { id: "c2", priority: 2 },
+    ]);
+    mocks.state.snapshots.set("c1", {
+      provider: "prov", status: "empty", remainingPct: 0,
+      resetAt: new Date(Date.now() - 60000).toISOString(),
+    });
+    mocks.state.settings = { quotaAwareRouting: true };
+    const creds = await getProviderCredentials("prov");
+    expect(creds.connectionId).toBe("c1");
   });
 });

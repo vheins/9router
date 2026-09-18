@@ -67,6 +67,12 @@ export {
   saveRequestDetail, getRequestDetails, getRequestDetailById, getDistinctProviders,
 } from "./repos/requestDetailsRepo.js";
 
+// Quota tracker (FORK-ONLY: persisted quota snapshots for quota-aware routing)
+export {
+  saveQuotaSnapshot, getQuotaSnapshot, getQuotaSnapshots, getAllQuotaSnapshots,
+  deleteQuotaSnapshot, deleteQuotaSnapshotsByProvider,
+} from "./repos/quotaTrackerRepo.js";
+
 // Export/import full DB
 export async function exportDb() {
   const db = await getAdapter();
@@ -79,6 +85,7 @@ export async function exportDb() {
     proxyPools: (await db.all(`SELECT * FROM proxyPools`)).map((r) => ({ ...parseJson(r.data, {}), id: r.id, isActive: r.isActive === 1, testStatus: r.testStatus, createdAt: r.createdAt, updatedAt: r.updatedAt })),
     apiKeys: (await db.all(`SELECT * FROM apiKeys`)).map((r) => ({ id: r.id, key: r.key, name: r.name, machineId: r.machineId, isActive: r.isActive === 1, createdAt: r.createdAt })),
     combos: (await db.all(`SELECT * FROM combos`)).map((r) => ({ id: r.id, name: r.name, kind: r.kind, models: parseJson(r.models, []), createdAt: r.createdAt, updatedAt: r.updatedAt })),
+    quotaTracker: (await db.all(`SELECT * FROM quotaTracker`)).map((r) => ({ connectionId: r.connectionId, provider: r.provider, status: r.status, remainingPct: r.remainingPct, resetAt: r.resetAt, quotas: parseJson(r.quotas, null), updatedAt: r.updatedAt })),
     modelAliases: {},
     customModels: [],
     mitmAlias: {},
@@ -107,6 +114,7 @@ export async function importDb(payload) {
     await db.run(`DELETE FROM proxyPools`);
     await db.run(`DELETE FROM apiKeys`);
     await db.run(`DELETE FROM combos`);
+    await db.run(`DELETE FROM quotaTracker`);
     await db.run(`DELETE FROM kv WHERE scope IN ('modelAliases', 'customModels', 'mitmAlias', 'pricing')`);
 
     // Settings
@@ -145,6 +153,12 @@ export async function importDb(payload) {
       await db.run(
         `INSERT OR REPLACE INTO combos(id, name, kind, models, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
         [c.id, c.name, c.kind || null, stringifyJson(c.models || []), c.createdAt || new Date().toISOString(), c.updatedAt || new Date().toISOString()]
+      );
+    }
+    for (const q of payload.quotaTracker || []) {
+      await db.run(
+        `INSERT OR REPLACE INTO quotaTracker(connectionId, provider, status, remainingPct, resetAt, quotas, updatedAt) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+        [q.connectionId, q.provider || null, q.status || "unknown", q.remainingPct ?? null, q.resetAt || null, q.quotas != null ? stringifyJson(q.quotas) : null, q.updatedAt || new Date().toISOString()]
       );
     }
     for (const [a, m] of Object.entries(payload.modelAliases || {})) {

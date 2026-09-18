@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { LEGACY_FILES, DB_DIR, DATA_FILE } from "./paths.js";
-import { TABLES, buildCreateTableSql, SCHEMA_VERSION } from "./schema.js";
+import { TABLES, buildCreateTableSql, SCHEMA_VERSION, FORK_SCHEMA_VERSION } from "./schema.js";
 import { MIGRATIONS, latestVersion } from "./migrations/index.js";
 import { getMetaFor, setMetaFor } from "./helpers/metaStore.js";
 import { makeBackupDir, backupFile, backupDbLite, pruneOldBackups } from "./backup.js";
@@ -318,14 +318,18 @@ export async function runMigrationOnce(adapter) {
 
   // Detect a pending schema change via the central SCHEMA_VERSION const.
   // A lightweight backup is taken BEFORE any schema mutation below.
+  // FORK: also compare the fork-only counter so fork schema additions (e.g. the
+  // quotaTracker table) trigger their own pre-change backup without touching the
+  // upstream-shared SCHEMA_VERSION.
   const storedSchemaVer = parseInt(await getMetaFor(adapter, "backupSchemaVersion", "0"), 10) || 0;
-  const schemaChanging = !fresh && storedSchemaVer < SCHEMA_VERSION;
+  const storedForkSchemaVer = parseInt(await getMetaFor(adapter, "backupForkSchemaVersion", "0"), 10) || 0;
+  const schemaChanging = !fresh && (storedSchemaVer < SCHEMA_VERSION || storedForkSchemaVer < FORK_SCHEMA_VERSION);
   if (schemaChanging) {
     try {
-      const backupDir = makeBackupDir(`schema-${storedSchemaVer}-to-${SCHEMA_VERSION}`);
+      const backupDir = makeBackupDir(`schema-${storedSchemaVer}.${storedForkSchemaVer}-to-${SCHEMA_VERSION}.${FORK_SCHEMA_VERSION}`);
       await backupDbLite(adapter, backupDir);
       pruneOldBackups();
-      console.log(`[DB][migrate] pre-schema backup ${storedSchemaVer} → ${SCHEMA_VERSION}: ${backupDir}`);
+      console.log(`[DB][migrate] pre-schema backup ${storedSchemaVer}.${storedForkSchemaVer} → ${SCHEMA_VERSION}.${FORK_SCHEMA_VERSION}: ${backupDir}`);
     } catch (e) {
       console.warn(`[DB][migrate] pre-schema backup failed (continuing): ${e.message}`);
     }
@@ -339,6 +343,7 @@ export async function runMigrationOnce(adapter) {
 
   // Stamp the schema version we just reached so future boots skip re-backup.
   await setMetaFor(adapter, "backupSchemaVersion", SCHEMA_VERSION);
+  await setMetaFor(adapter, "backupForkSchemaVersion", FORK_SCHEMA_VERSION);
 
   // 3. One-time legacy JSON import (only if DB was fresh on entry)
   const alreadyImported = fs.existsSync(MIGRATED_MARKER);
@@ -361,6 +366,7 @@ export async function runMigrationOnce(adapter) {
         await importLegacyDetails(adapter, legacyDetails);
         await setMetaFor(adapter, "appVersion", getAppVersion());
         await setMetaFor(adapter, "backupSchemaVersion", SCHEMA_VERSION);
+        await setMetaFor(adapter, "backupForkSchemaVersion", FORK_SCHEMA_VERSION);
         await setMetaFor(adapter, "migratedAt", new Date().toISOString());
       });
     } catch (err) {
