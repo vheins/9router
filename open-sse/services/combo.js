@@ -5,7 +5,9 @@
 import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
+import { getPricingForModel } from "../providers/pricing.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
+import { orderTargets, nextRoundRobinIndex, resetRotationState, isSelectionStrategy } from "./routingStrategies.js";
 
 // Hard capabilities = input modalities; missing one drops request data (e.g. image
 // stripped). Must be prioritized. Soft (e.g. search) only degrades a feature.
@@ -81,11 +83,11 @@ export function reorderByCapabilities(models, required) {
     .map((x) => x.m);
 }
 
-/**
- * Track rotation state per combo (for round-robin strategy)
- * @type {Map<string, { index: number, consecutiveUseCount: number }>}
- */
-const comboRotationState = new Map();
+// Rotation state now lives in the shared routing engine (routingStrategies.js),
+// keyed by combo name, so combos and provider connections share one implementation.
+
+// Last successful model per combo — powers the `lkgp` (last-known-good) strategy.
+const lastGoodModel = new Map();
 
 // Trailing run of items after the last assistant/model turn = the current user
 // turn. It may span several messages (e.g. text + image split across blocks),
@@ -183,57 +185,61 @@ export function detectRequiredCapabilities(body) {
   return required;
 }
 
-function normalizeStickyLimit(stickyLimit) {
-  const parsed = Number.parseInt(stickyLimit, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
-}
-
-function rotateModelsFromIndex(models, currentIndex) {
-  const rotatedModels = [...models];
-  for (let i = 0; i < currentIndex; i++) {
-    const moved = rotatedModels.shift();
-    rotatedModels.push(moved);
-  }
-  return rotatedModels;
+// Normalize a combo's model strings into routing-engine targets. Cost is pulled
+// from the pricing registry so `cost-optimized`/`auto` work without extra config;
+// per-model `weight` can be supplied via a combo's strategy config.
+function modelsToTargets(models, comboConfig = {}) {
+  const weights = comboConfig.modelWeights || {};
+  return models.map((modelStr) => {
+    const slash = typeof modelStr === "string" ? modelStr.indexOf("/") : -1;
+    const provider = slash > 0 ? modelStr.slice(0, slash) : "";
+    const model = slash > 0 ? modelStr.slice(slash + 1) : modelStr;
+    const pricing = provider ? getPricingForModel(provider, model) : null;
+    // Blended $/1M estimate (input+output average) as the per-request cost proxy.
+    const inCost = Number(pricing?.input);
+    const outCost = Number(pricing?.output);
+    const cost = (Number.isFinite(inCost) || Number.isFinite(outCost))
+      ? ((Number.isFinite(inCost) ? inCost : 0) + (Number.isFinite(outCost) ? outCost : 0)) / 2
+      : undefined;
+    return { key: modelStr, priority: 0, weight: weights[modelStr], cost };
+  });
 }
 
 /**
- * Get rotated model list based on strategy
+ * Order combo models by strategy.
  * @param {string[]} models - Array of model strings
  * @param {string} comboName - Name of the combo
- * @param {string} strategy - "fallback" or "round-robin"
+ * @param {string} strategy - selection strategy ("fallback" | "round-robin" | "weighted" | ...)
  * @param {number|string} [stickyLimit=1] - Requests per combo model before switching
- * @returns {string[]} Rotated models array
+ * @param {object} [config] - { modelWeights?, lastGoodKey? }
+ * @returns {string[]} ordered models
  */
-export function getRotatedModels(models, comboName, strategy, stickyLimit = 1) {
-  if (!models || models.length <= 1 || strategy !== "round-robin") {
+export function getRotatedModels(models, comboName, strategy, stickyLimit = 1, config = {}) {
+  if (!models || models.length <= 1 || !isSelectionStrategy(strategy)) {
+    return models;
+  }
+
+  // Default order (fallback/fill-first) needs no engine work — preserve the array.
+  if (strategy === "fallback" || strategy === "fill-first") {
     return models;
   }
 
   const rotationKey = comboName || "__default__";
-  const normalizedStickyLimit = normalizeStickyLimit(stickyLimit);
-  const existingState = comboRotationState.get(rotationKey);
-  const state = typeof existingState === "number"
-    ? { index: existingState, consecutiveUseCount: 0 }
-    : (existingState || { index: 0, consecutiveUseCount: 0 });
+  const targets = modelsToTargets(models, config);
 
-  const currentIndex = state.index % models.length;
-  const rotatedModels = rotateModelsFromIndex(models, currentIndex);
-  const nextUseCount = state.consecutiveUseCount + 1;
+  // round-robin needs the caller-owned sticky index; other strategies ignore it.
+  const rotationIndex = strategy === "round-robin"
+    ? nextRoundRobinIndex(rotationKey, models.length, stickyLimit)
+    : 0;
 
-  if (nextUseCount >= normalizedStickyLimit) {
-    comboRotationState.set(rotationKey, {
-      index: (currentIndex + 1) % models.length,
-      consecutiveUseCount: 0,
-    });
-  } else {
-    comboRotationState.set(rotationKey, {
-      index: currentIndex,
-      consecutiveUseCount: nextUseCount,
-    });
-  }
+  const ordered = orderTargets(targets, strategy, {
+    rotationIndex,
+    lastGoodKey: config.lastGoodKey,
+    lastHeadKey: config.lastHeadKey,
+    rng: config.rng,
+  });
 
-  return rotatedModels;
+  return ordered.map((t) => t.key);
 }
 
 /**
@@ -241,8 +247,9 @@ export function getRotatedModels(models, comboName, strategy, stickyLimit = 1) {
  * @param {string} [comboName] - Combo name to reset; omit to clear all
  */
 export function resetComboRotation(comboName) {
-  if (comboName) comboRotationState.delete(comboName);
-  else comboRotationState.clear();
+  resetRotationState(comboName);
+  if (comboName) lastGoodModel.delete(comboName);
+  else lastGoodModel.clear();
 }
 
 /**
@@ -273,13 +280,17 @@ export function getComboModelsFromData(modelStr, combosData) {
  * @param {Function} options.handleSingleModel - Function to handle single model: (body, modelStr) => Promise<Response>
  * @param {Object} options.log - Logger object
  * @param {string} [options.comboName] - Name of the combo (for round-robin tracking)
- * @param {string} [options.comboStrategy] - Strategy: "fallback" or "round-robin"
+ * @param {string} [options.comboStrategy] - Strategy: "fallback" | "round-robin" | selection strategy
  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
+ * @param {object} [options.comboConfig] - { modelWeights? } per-model weights for weighted/auto
  * @returns {Promise<Response>}
  */
-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true }) {
+export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, comboConfig = {} }) {
   // Apply rotation strategy if enabled
-  let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
+  let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit, {
+    ...comboConfig,
+    lastGoodKey: comboName ? lastGoodModel.get(comboName) : undefined,
+  });
 
   // Auto-switch: float models that satisfy the request's required capabilities to the front.
   if (autoSwitch) {
@@ -307,6 +318,7 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       // Success (2xx) - return response
       if (result.ok) {
         log.info("COMBO", `Model ${modelStr} succeeded`);
+        if (comboName) lastGoodModel.set(comboName, modelStr);
         return result;
       }
 

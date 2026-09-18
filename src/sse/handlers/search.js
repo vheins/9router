@@ -83,7 +83,8 @@ export async function handleSearch(request) {
       log,
       comboName: providerInput,
       comboStrategy,
-      comboStickyLimit
+      comboStickyLimit,
+      comboConfig: { modelWeights: comboStrategies[providerInput]?.modelWeights }
     });
   }
 

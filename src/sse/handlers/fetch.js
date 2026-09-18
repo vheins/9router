@@ -103,7 +103,8 @@ export async function handleFetch(request) {
       log,
       comboName: providerInput,
       comboStrategy,
-      comboStickyLimit
+      comboStickyLimit,
+      comboConfig: { modelWeights: comboStrategies[providerInput]?.modelWeights }
     });
   }
 

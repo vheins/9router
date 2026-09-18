@@ -4,6 +4,13 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { getStatusVariant as getConnectionStatusVariant } from "@/shared/utils/connectionStatus";
 import PropTypes from "prop-types";
 import { Card, Badge, Button, Modal, Select, Toggle, EditConnectionModal, ConfirmModal } from "@/shared/components";
+import { SELECTION_STRATEGIES } from "open-sse/services/routingStrategies.js";
+
+// Provider-connection selection strategies (shared engine). "fill-first" is the default.
+const PROVIDER_STRATEGY_OPTIONS = SELECTION_STRATEGIES.map((s) => ({
+  value: s.value,
+  label: `${s.label} — ${s.desc}`,
+}));
 
 // ── CooldownTimer ──────────────────────────────────────────────
 function CooldownTimer({ until }) {
@@ -196,7 +203,7 @@ ConnectionRow.propTypes = {
 // ── AddApiKeyModal ─────────────────────────────────────────────
 function AddApiKeyModal({ isOpen, provider, providerName, proxyPools, onSave, onClose }) {
   const NONE = "__none__";
-  const [formData, setFormData] = useState({ name: "", apiKey: "", priority: 1, proxyPoolId: NONE });
+  const [formData, setFormData] = useState({ name: "", apiKey: "", priority: 1, weight: 1, proxyPoolId: NONE });
   const [validating, setValidating] = useState(false);
   const [validationResult, setValidationResult] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -236,6 +243,7 @@ function AddApiKeyModal({ isOpen, provider, providerName, proxyPools, onSave, on
         name: formData.name,
         apiKey: formData.apiKey,
         priority: formData.priority,
+        weight: formData.weight,
         proxyPoolId: formData.proxyPoolId === NONE ? null : formData.proxyPoolId,
         testStatus: isValid ? "active" : "unknown",
       });
@@ -267,9 +275,15 @@ function AddApiKeyModal({ isOpen, provider, providerName, proxyPools, onSave, on
             {validationResult === "success" ? "Valid" : "Invalid"}
           </Badge>
         )}
-        <div>
-          <label className="text-xs text-text-muted mb-1 block">Priority</label>
-          <input type="number" className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary" value={formData.priority} onChange={(e) => setFormData({ ...formData, priority: Number.parseInt(e.target.value) || 1 })} />
+        <div className="flex gap-2">
+          <div className="flex-1">
+            <label className="text-xs text-text-muted mb-1 block">Priority</label>
+            <input type="number" className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary" value={formData.priority} onChange={(e) => setFormData({ ...formData, priority: Number.parseInt(e.target.value) || 1 })} />
+          </div>
+          <div className="flex-1">
+            <label className="text-xs text-text-muted mb-1 block">Weight</label>
+            <input type="number" min={0} className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary" value={formData.weight} onChange={(e) => setFormData({ ...formData, weight: Number.parseFloat(e.target.value) || 0 })} />
+          </div>
         </div>
         <Select label="Proxy Pool" value={formData.proxyPoolId} onChange={(e) => setFormData({ ...formData, proxyPoolId: e.target.value })}
           options={[{ value: NONE, label: "None" }, ...(proxyPools || []).map((p) => ({ value: p.id, label: p.name }))]} />
@@ -333,7 +347,7 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
       const data = res.ok ? await res.json() : {};
       const current = data.providerStrategies || {};
       const override = {};
-      if (strategy) override.fallbackStrategy = strategy;
+      if (strategy && strategy !== "fill-first") override.fallbackStrategy = strategy;
       if (strategy === "round-robin" && stickyLimit !== "") override.stickyRoundRobinLimit = Number(stickyLimit) || 3;
       const updated = { ...current };
       if (Object.keys(override).length === 0) delete updated[providerId];
@@ -404,16 +418,20 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-4">
           <h2 className="text-lg font-semibold">Connections</h2>
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-xs text-text-muted font-medium">Round Robin</span>
-            <Toggle
-              checked={providerStrategy === "round-robin"}
-              onChange={(enabled) => {
-                const strategy = enabled ? "round-robin" : null;
-                setProviderStrategy(strategy);
-                if (enabled && !providerStickyLimit) setProviderStickyLimit("1");
-                saveStrategy(strategy, enabled ? (providerStickyLimit || "1") : providerStickyLimit);
-              }}
-            />
+            <span className="text-xs text-text-muted font-medium">Strategy</span>
+            <div className="w-full sm:w-[220px]">
+              <Select
+                options={PROVIDER_STRATEGY_OPTIONS}
+                value={providerStrategy || "fill-first"}
+                onChange={(e) => {
+                  const strategy = e.target.value;
+                  setProviderStrategy(strategy === "fill-first" ? null : strategy);
+                  if (strategy === "round-robin" && !providerStickyLimit) setProviderStickyLimit("1");
+                  saveStrategy(strategy, providerStickyLimit || "1");
+                }}
+                selectClassName="py-1.5 text-xs"
+              />
+            </div>
             {providerStrategy === "round-robin" && (
               <div className="flex flex-wrap items-center gap-1.5">
                 <span className="text-xs text-text-muted">Sticky:</span>

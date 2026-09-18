@@ -91,6 +91,7 @@ export async function PUT(request, { params }) {
     const {
       name,
       priority,
+      weight,
       globalPriority,
       defaultModel,
       isActive,
@@ -119,6 +120,7 @@ export async function PUT(request, { params }) {
     const updateData = {};
     if (name !== undefined) updateData.name = name;
     if (priority !== undefined) updateData.priority = priority;
+    if (weight !== undefined) updateData.weight = weight;
     if (globalPriority !== undefined) updateData.globalPriority = globalPriority;
     if (defaultModel !== undefined) updateData.defaultModel = defaultModel;
     if (isActive !== undefined) updateData.isActive = isActive;

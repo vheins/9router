@@ -9,6 +9,7 @@ import { Card, Button, Modal, Input, CardSkeleton, ModelSelectModal, ConfirmModa
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { useModelCaps } from "@/shared/hooks/useModelCaps";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
+import { SELECTION_STRATEGIES } from "open-sse/services/routingStrategies.js";
 
 // Validate combo name: only a-z, A-Z, 0-9, -, _
 const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
@@ -165,8 +166,12 @@ export default function CombosPage() {
     try {
       const updated = { ...comboStrategies };
       const next = { ...(updated[comboName] || {}), ...patch };
+      // Drop empty weight maps so the entry can prune cleanly.
+      if (next.modelWeights && Object.keys(next.modelWeights).length === 0) delete next.modelWeights;
       // Prune to keep settings clean: default fallback with no extras = no entry.
-      if (!next.fallbackStrategy || next.fallbackStrategy === "fallback") {
+      const hasNonDefaultStrategy = next.fallbackStrategy && next.fallbackStrategy !== "fallback";
+      const hasExtras = next.judgeModel || next.modelWeights || next.fusionTuning;
+      if (!hasNonDefaultStrategy && !hasExtras) {
         delete updated[comboName];
       } else {
         updated[comboName] = next;
@@ -290,7 +295,10 @@ export default function CombosPage() {
 
 const STRATEGY_OPTIONS = [
   { value: "fallback", label: "Fallback — try in order" },
-  { value: "round-robin", label: "Round Robin — rotate" },
+  ...SELECTION_STRATEGIES.filter((s) => s.value !== "fill-first").map((s) => ({
+    value: s.value,
+    label: `${s.label} — ${s.desc}`,
+  })),
   { value: "fusion", label: "Fusion — panel + judge" },
 ];
 
@@ -299,6 +307,8 @@ function ComboCard({ combo, getCaps, activeProviders = [], copied, onCopy, onEdi
   const current = strategy.fallbackStrategy || "fallback";
   const judge = strategy.judgeModel || "";
   const isFusion = current === "fusion";
+  const isWeighted = current === "weighted";
+  const weights = strategy.modelWeights || {};
 
   return (
     <Card padding="sm" className="group">
@@ -345,6 +355,25 @@ function ComboCard({ combo, getCaps, activeProviders = [], copied, onCopy, onEdi
                     <span className="material-symbols-outlined text-[13px]">close</span>
                   </button>
                 )}
+              </div>
+            )}
+            {/* Weighted: per-model weight editor */}
+            {isWeighted && combo.models.length > 0 && (
+              <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
+                <span className="text-[11px] font-medium text-text-muted">Weights</span>
+                {combo.models.map((model) => (
+                  <label key={model} className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 font-mono text-[11px] text-text-muted" title={model}>
+                    <span className="max-w-[140px] truncate">{model}</span>
+                    <input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={weights[model] ?? 1}
+                      onChange={(e) => onSetStrategy({ modelWeights: { ...weights, [model]: Number(e.target.value) || 0 } })}
+                      className="w-12 bg-transparent text-right focus:outline-none"
+                    />
+                  </label>
+                ))}
               </div>
             )}
           </div>

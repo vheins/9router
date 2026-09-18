@@ -3,9 +3,19 @@
 import { useParams, notFound, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Card, Button, Input, Toggle, ModelSelectModal } from "@/shared/components";
+import { Card, Button, Input, Select, ModelSelectModal } from "@/shared/components";
 import ProviderIcon from "@/shared/components/ProviderIcon";
 import { AI_PROVIDERS, MEDIA_PROVIDER_KINDS } from "@/shared/constants/providers";
+import { SELECTION_STRATEGIES } from "open-sse/services/routingStrategies.js";
+
+// Media combos only support selection strategies (no fusion panel here).
+const COMBO_STRATEGY_OPTIONS = [
+  { value: "fallback", label: "Fallback — try in order" },
+  ...SELECTION_STRATEGIES.filter((s) => s.value !== "fill-first").map((s) => ({
+    value: s.value,
+    label: `${s.label} — ${s.desc}`,
+  })),
+];
 
 // Parse "providerId/model" or just "providerId" → { providerId, model }
 function parseModelEntry(entry) {
@@ -52,7 +62,7 @@ export default function ComboDetailPage() {
   const [name, setName] = useState("");
   const [nameError, setNameError] = useState("");
   const [providers, setProviders] = useState([]);
-  const [roundRobin, setRoundRobin] = useState(false);
+  const [strategy, setStrategy] = useState("fallback");
   const [showPicker, setShowPicker] = useState(false);
   const [logs, setLogs] = useState([]);
   const [testing, setTesting] = useState(false);
@@ -84,7 +94,7 @@ export default function ComboDetailPage() {
       setName(c.name);
       setProviders(c.models || []);
       const s = settingsRes.ok ? await settingsRes.json() : {};
-      setRoundRobin(s.comboStrategies?.[c.name]?.fallbackStrategy === "round-robin");
+      setStrategy(s.comboStrategies?.[c.name]?.fallbackStrategy || "fallback");
       const allLogs = logsRes.ok ? await logsRes.json() : [];
       setLogs(allLogs.filter((l) => typeof l === "string" && l.includes(c.name)).slice(0, 50));
     } catch { /* noop */ }
@@ -149,12 +159,12 @@ export default function ComboDetailPage() {
     await saveCombo({ models: next });
   };
 
-  const handleToggleRoundRobin = async (enabled) => {
-    setRoundRobin(enabled);
+  const handleSetStrategy = async (next) => {
+    setStrategy(next);
     const settingsRes = await fetch("/api/settings", { cache: "no-store" });
     const s = settingsRes.ok ? await settingsRes.json() : {};
     const updated = { ...(s.comboStrategies || {}) };
-    if (enabled) updated[combo.name] = { fallbackStrategy: "round-robin" };
+    if (next && next !== "fallback") updated[combo.name] = { fallbackStrategy: next };
     else delete updated[combo.name];
     await fetch("/api/settings", {
       method: "PATCH",
@@ -268,12 +278,19 @@ export default function ComboDetailPage() {
             <Input label="Combo Name" value={name} onChange={(e) => { setName(e.target.value); validateName(e.target.value); }} onBlur={handleSaveName} error={nameError} />
             <p className="text-[10px] text-text-muted mt-0.5">Only letters, numbers, -, _ and .</p>
           </div>
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-3">
             <div>
-              <p className="text-sm font-medium">Round Robin</p>
-              <p className="text-xs text-text-muted">Rotate providers across requests instead of strict fallback order.</p>
+              <p className="text-sm font-medium">Selection Strategy</p>
+              <p className="text-xs text-text-muted">How the combo picks among its providers per request.</p>
             </div>
-            <Toggle checked={roundRobin} onChange={handleToggleRoundRobin} />
+            <div className="w-[220px] shrink-0">
+              <Select
+                options={COMBO_STRATEGY_OPTIONS}
+                value={strategy}
+                onChange={(e) => handleSetStrategy(e.target.value)}
+                selectClassName="py-1.5 text-xs"
+              />
+            </div>
           </div>
         </div>
       </Card>

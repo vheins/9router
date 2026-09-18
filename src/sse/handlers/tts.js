@@ -59,6 +59,7 @@ export async function handleTts(request) {
       comboName: modelStr,
       comboStrategy,
       comboStickyLimit,
+      comboConfig: { modelWeights: comboStrategies[modelStr]?.modelWeights },
     });
   }
 

@@ -61,6 +61,7 @@ export async function handleImageGeneration(request) {
       comboName: modelStr,
       comboStrategy,
       comboStickyLimit,
+      comboConfig: { modelWeights: comboStrategies[modelStr]?.modelWeights },
     });
   }
 

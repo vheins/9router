@@ -1,6 +1,8 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
+import { getConnectionActiveCount } from "@/lib/usageDb.js";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
+import { orderTargets, isSelectionStrategy } from "open-sse/services/routingStrategies.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
@@ -13,6 +15,9 @@ import * as log from "../utils/logger.js";
 // removing the cross-provider contention a single global mutex imposed.
 const selectionMutexes = new Map(); // providerId -> Promise
 
+// Per-provider previous head — lets the `random` strategy avoid immediate repeats.
+const lastProviderHead = new Map(); // providerId -> connectionId
+
 const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
 
 function githubMonthlyResetMs(status, errorText, provider) {
@@ -20,6 +25,50 @@ function githubMonthlyResetMs(status, errorText, provider) {
   if (!String(errorText || "").toLowerCase().includes(GITHUB_MONTHLY_USAGE_LIMIT)) return null;
   const now = new Date();
   return Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+}
+
+// Build routing-engine targets from available connections. Missing fields stay
+// undefined so the engine degrades gracefully (keeps the caller's order).
+function connectionsToTargets(connections, { isAntigravity, model, antigravityQuotaCache }) {
+  return connections.map((c) => {
+    let quotaRemainingPct;
+    let resetAtMs;
+    if (isAntigravity && model && antigravityQuotaCache) {
+      const quota = antigravityQuotaCache.get(c.id)?.[model];
+      if (quota) {
+        quotaRemainingPct = quota.remainingPercentage;
+        resetAtMs = quota.resetAt ? new Date(quota.resetAt).getTime() : undefined;
+      }
+    }
+    return {
+      key: c.id,
+      priority: c.priority,
+      weight: c.weight,
+      usageCount: c.usageCount,
+      consecutiveUseCount: c.consecutiveUseCount,
+      activeRequests: getConnectionActiveCount(c.id),
+      consecutiveErrors: c.backoffLevel,
+      testStatus: c.testStatus,
+      lastUsedAt: c.lastUsedAt,
+      lastSuccessAt: c.lastSuccessAt,
+      quotaRemainingPct,
+      resetAtMs,
+    };
+  });
+}
+
+// Most-recently-successful connection — powers the `lkgp` strategy at provider level.
+function pickLastGoodKey(connections) {
+  let best = null;
+  let bestTs = -Infinity;
+  for (const c of connections) {
+    const t = c.lastSuccessAt ? new Date(c.lastSuccessAt).getTime() : null;
+    if (Number.isFinite(t) && t > bestTs) {
+      bestTs = t;
+      best = c.id;
+    }
+  }
+  return best;
 }
 
 /**
@@ -156,9 +205,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         log.info("AUTH", `${provider} | pinned to ${connection.id?.slice(0, 8)} (${connection.name || connection.email || "unnamed"})`);
       }
     }
+
     if (connection) {
-      // skip strategy
+      // skip strategy (pinned)
     } else if (strategy === "round-robin") {
+      // Legacy sticky round-robin: persisted to DB via lastUsedAt/consecutiveUseCount.
       const stickyLimit = providerOverride.stickyRoundRobinLimit || settings.stickyRoundRobinLimit || 3;
 
       // Sort by lastUsed (most recent first) to find current candidate
@@ -197,6 +248,20 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
           consecutiveUseCount: 1
         });
       }
+    } else if (isSelectionStrategy(strategy) && strategy !== "fill-first" && strategy !== "fallback") {
+      // Shared routing engine (weighted / p2c / least-used / random / cost-optimized /
+      // headroom / reset-* / lkgp / auto / priority). availableConnections is already
+      // priority-sorted, so the engine's default/unknown path preserves fill-first.
+      const targets = connectionsToTargets(availableConnections, { isAntigravity, model, antigravityQuotaCache });
+      const ordered = orderTargets(targets, strategy, {
+        rotationIndex: 0,
+        lastGoodKey: pickLastGoodKey(availableConnections),
+        lastHeadKey: lastProviderHead.get(providerId),
+      });
+      const chosenId = ordered[0]?.key;
+      connection = availableConnections.find((c) => c.id === chosenId) || availableConnections[0];
+      lastProviderHead.set(providerId, connection.id);
+      log.info("AUTH", `${provider} | ${strategy} → ${connection.id?.slice(0, 8)} (${connection.name || connection.email || "unnamed"})`);
     } else {
       // Default: fill-first (already sorted by priority in getProviderConnections)
       connection = availableConnections[0];

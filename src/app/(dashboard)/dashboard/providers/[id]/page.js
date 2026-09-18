@@ -5,10 +5,11 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import Image from "next/image";
 import { getProviderIconSrc, markProviderIconMissing } from "@/shared/utils/providerIcon";
-import { Card, Button, Badge, Input, Modal, CardSkeleton, OAuthModal, KiroOAuthWrapper, CursorAuthModal, XiaomiMimoAuthModal, IFlowCookieModal, GitLabAuthModal, Toggle, Select, EditConnectionModal, NoAuthProxyCard, ConfirmModal } from "@/shared/components";
+import { Card, Button, Badge, Input, Modal, CardSkeleton, OAuthModal, KiroOAuthWrapper, CursorAuthModal, XiaomiMimoAuthModal, IFlowCookieModal, GitLabAuthModal, Select, EditConnectionModal, NoAuthProxyCard, ConfirmModal } from "@/shared/components";
 import { OAUTH_PROVIDERS, APIKEY_PROVIDERS, FREE_PROVIDERS, FREE_TIER_PROVIDERS, WEB_COOKIE_PROVIDERS, getProviderAlias, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, AI_PROVIDERS } from "@/shared/constants/providers";
 import { getModelsByProviderId, getModelKind } from "@/shared/constants/models";
 import { getThinkingLevels } from "open-sse/providers/thinkingLevels.js";
+import { SELECTION_STRATEGIES } from "open-sse/services/routingStrategies.js";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { useModelCaps } from "@/shared/hooks/useModelCaps";
 import { translate } from "@/i18n/runtime";
@@ -25,6 +26,12 @@ import BulkImportCodexModal from "./BulkImportCodexModal";
 import BulkImportGrokCliModal from "./BulkImportGrokCliModal";
 
 const ONE_BY_ONE_DELAY_MS = 1000;
+
+// Provider-connection selection strategies (shared engine). "fill-first" is the default.
+const PROVIDER_STRATEGY_OPTIONS = SELECTION_STRATEGIES.map((s) => ({
+  value: s.value,
+  label: `${s.label} — ${s.desc}`,
+}));
 
 const AUTO_PING_SETTINGS_KEYS = {
   claude: "claudeAutoPing",
@@ -379,7 +386,7 @@ export default function ProviderDetailPage() {
 
       // Build override: null strategy means remove override, use global
       const override = {};
-      if (strategy) override.fallbackStrategy = strategy;
+      if (strategy && strategy !== "fill-first") override.fallbackStrategy = strategy;
       if (strategy === "round-robin" && stickyLimit !== "") {
         override.stickyRoundRobinLimit = Number(stickyLimit) || 3;
       }
@@ -401,11 +408,10 @@ export default function ProviderDetailPage() {
     }
   };
 
-  const handleRoundRobinToggle = (enabled) => {
-    const strategy = enabled ? "round-robin" : null;
-    const sticky = enabled ? (providerStickyLimit || "1") : providerStickyLimit;
-    if (enabled && !providerStickyLimit) setProviderStickyLimit("1");
-    setProviderStrategy(strategy);
+  const handleStrategyChange = (strategy) => {
+    const sticky = providerStickyLimit || "1";
+    if (strategy === "round-robin" && !providerStickyLimit) setProviderStickyLimit("1");
+    setProviderStrategy(strategy === "fill-first" ? null : strategy);
     saveProviderStrategy(strategy, sticky);
   };
 
@@ -1538,13 +1544,17 @@ export default function ProviderDetailPage() {
                   )}
                 </>
               )}
-              {/* Round Robin toggle */}
+              {/* Connection selection strategy (shared routing engine) */}
               <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs text-text-muted font-medium">Round Robin</span>
-                <Toggle
-                  checked={providerStrategy === "round-robin"}
-                  onChange={handleRoundRobinToggle}
-                />
+                <span className="text-xs text-text-muted font-medium">Strategy</span>
+                <div className="w-full sm:w-[220px]">
+                  <Select
+                    options={PROVIDER_STRATEGY_OPTIONS}
+                    value={providerStrategy || "fill-first"}
+                    onChange={(e) => handleStrategyChange(e.target.value)}
+                    selectClassName="py-1.5 text-xs"
+                  />
+                </div>
                 {providerStrategy === "round-robin" && (
                   <div className="flex items-center gap-1.5">
                     <span className="text-xs text-text-muted">Sticky:</span>
