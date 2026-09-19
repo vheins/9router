@@ -37,7 +37,7 @@ function CooldownTimer({ until }) {
 CooldownTimer.propTypes = { until: PropTypes.string.isRequired };
 
 // ── ConnectionRow ──────────────────────────────────────────────
-function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMoveUp, onMoveDown, onToggleActive, onUpdateProxy, onEdit, onDelete }) {
+function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMoveUp, onMoveDown, onToggleActive, onToggleBanned, onUpdateProxy, onEdit, onDelete }) {
   const [showProxyDropdown, setShowProxyDropdown] = useState(false);
   const [updatingProxy, setUpdatingProxy] = useState(false);
   const [isCooldown, setIsCooldown] = useState(false);
@@ -94,7 +94,21 @@ function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMov
 
   const effectiveStatus = connection.testStatus === "unavailable" && !isCooldown ? "active" : connection.testStatus;
 
-  const getStatusVariant = () => getConnectionStatusVariant(connection.isActive, effectiveStatus);
+  const getStatusVariant = () => getConnectionStatusVariant(connection.isActive, effectiveStatus, connection.banned);
+
+  const isBanned = connection.banned === true;
+  const [banPending, setBanPending] = useState(false);
+  const banTooltipText = [
+    connection.banReason || null,
+    connection.banRetryAt ? `Retry after ${connection.banRetryAt}` : (!connection.banRetryAt && isBanned ? "Skipped by routing until manually unbanned" : null),
+  ].filter(Boolean).join(" — ") || null;
+
+  const handleToggleBanned = async () => {
+    if (!onToggleBanned || banPending) return;
+    setBanPending(true);
+    try { await onToggleBanned(!isBanned); }
+    finally { setBanPending(false); }
+  };
 
   const displayName = isOAuth
     ? connection.name || connection.email || connection.displayName || "OAuth Account"
@@ -124,10 +138,20 @@ function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMov
             <Badge variant={getStatusVariant()} size="sm" dot>
               {connection.isActive === false ? "disabled" : (effectiveStatus || "Unknown")}
             </Badge>
+            {isBanned && (
+              <span title={banTooltipText || "Banned"}>
+                <Badge variant="warning" size="sm">banned</Badge>
+              </span>
+            )}
             {hasAnyProxy && <Badge variant={proxyBadgeVariant} size="sm">Proxy</Badge>}
             {isCooldown && connection.isActive !== false && <CooldownTimer until={modelLockUntil} />}
-            {connection.lastError && connection.isActive !== false && (
+            {connection.lastError && connection.isActive !== false && !isBanned && (
               <span className="text-xs text-red-500 truncate max-w-[300px]" title={connection.lastError}>{connection.lastError}</span>
+            )}
+            {isBanned && (connection.banReason || connection.banRetryAt) && (
+              <span className="text-xs text-yellow-600 dark:text-yellow-400 truncate max-w-[300px]" title={banTooltipText}>
+                {connection.banReason || `Retry after ${connection.banRetryAt}`}
+              </span>
             )}
             <span className="text-xs text-text-muted">#{connection.priority}</span>
           </div>
@@ -166,12 +190,23 @@ function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMov
             <span className="material-symbols-outlined text-[18px]">edit</span>
             <span className="text-[10px] leading-tight">Edit</span>
           </button>
+          {onToggleBanned && (
+            <button
+              onClick={handleToggleBanned}
+              disabled={banPending}
+              title={isBanned ? (banTooltipText || "Unban this account") : "Ban this account (excluded from routing)"}
+              className={`flex flex-col items-center px-2 py-1 rounded hover:bg-black/5 dark:hover:bg-white/5 ${isBanned ? "text-yellow-600 dark:text-yellow-400" : "text-text-muted hover:text-primary"} ${banPending ? "opacity-50 cursor-wait" : ""}`}
+            >
+              <span className="material-symbols-outlined text-[18px]">{banPending ? "progress_activity" : isBanned ? "lock_open" : "block"}</span>
+              <span className="text-[10px] leading-tight">{isBanned ? "Unban" : "Ban"}</span>
+            </button>
+          )}
           <button onClick={onDelete} className="flex flex-col items-center px-2 py-1 rounded hover:bg-red-500/10 text-red-500">
             <span className="material-symbols-outlined text-[18px]">delete</span>
             <span className="text-[10px] leading-tight">Delete</span>
           </button>
         </div>
-        <Toggle size="sm" checked={connection.isActive ?? true} onChange={onToggleActive} title={(connection.isActive ?? true) ? "Disable" : "Enable"} />
+        <Toggle size="sm" checked={connection.isActive ?? true} onChange={onToggleActive} title={isBanned ? "Banned: skipped by routing even while enabled" : (connection.isActive ?? true) ? "Disable" : "Enable"} />
       </div>
     </div>
   );
@@ -185,6 +220,9 @@ ConnectionRow.propTypes = {
     displayName: PropTypes.string,
     testStatus: PropTypes.string,
     isActive: PropTypes.bool,
+    banned: PropTypes.bool,
+    banReason: PropTypes.string,
+    banRetryAt: PropTypes.string,
     lastError: PropTypes.string,
     priority: PropTypes.number,
   }).isRequired,
@@ -195,6 +233,7 @@ ConnectionRow.propTypes = {
   onMoveUp: PropTypes.func.isRequired,
   onMoveDown: PropTypes.func.isRequired,
   onToggleActive: PropTypes.func.isRequired,
+  onToggleBanned: PropTypes.func,
   onUpdateProxy: PropTypes.func,
   onEdit: PropTypes.func.isRequired,
   onDelete: PropTypes.func.isRequired,
@@ -409,6 +448,19 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
     } catch (e) { console.log("toggle error:", e); }
   };
 
+  const handleToggleBanned = async (id, banned) => {
+    try {
+      const res = await fetch(`/api/providers/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ banned }) });
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        const updated = data?.connection || null;
+        setConnections((prev) => prev.map((c) => c.id === id
+          ? (updated ? { ...c, ...updated } : { ...c, banned, bannedAt: banned ? c.bannedAt || new Date().toISOString() : null, banReason: banned ? (c.banReason || "Manually banned") : null, banRetryAt: null })
+          : c));
+      }
+    } catch (e) { console.log("ban toggle error:", e); }
+  };
+
   const handleUpdateProxy = async (connId, proxyPoolId) => {
     try {
       const res = await fetch(`/api/providers/${connId}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ proxyPoolId: proxyPoolId || null }) });
@@ -492,6 +544,7 @@ export default function ConnectionsCard({ providerId, isOAuth }) {
                   onMoveUp={() => handleSwapPriority(idx, idx - 1)}
                   onMoveDown={() => handleSwapPriority(idx, idx + 1)}
                   onToggleActive={(isActive) => handleToggleActive(conn.id, isActive)}
+                  onToggleBanned={(banned) => handleToggleBanned(conn.id, banned)}
                   onUpdateProxy={(poolId) => handleUpdateProxy(conn.id, poolId)}
                   onEdit={() => { setSelectedConnection(conn); setShowEditModal(true); }}
                   onDelete={() => handleDelete(conn.id)}

@@ -6,7 +6,7 @@ import PropTypes from "prop-types";
 import { Badge, Toggle, Tooltip } from "@/shared/components";
 import CooldownTimer from "./CooldownTimer";
 
-export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMoveUp, onMoveDown, onToggleActive, onUpdateProxy, onEdit, onDelete, oneByOneStatus = null, autoPing = null }) {
+export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst, isLast, onMoveUp, onMoveDown, onToggleActive, onToggleBanned, onUpdateProxy, onEdit, onDelete, oneByOneStatus = null, autoPing = null }) {
   const [showProxyDropdown, setShowProxyDropdown] = useState(false);
   const [updatingProxy, setUpdatingProxy] = useState(false);
   const proxyDropdownRef = useRef(null);
@@ -116,7 +116,24 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
     ? "active"  // Cooldown expired u2192 treat as active
     : connection.testStatus;
 
-  const getStatusVariant = () => getConnectionStatusVariant(connection.isActive, effectiveStatus);
+  const getStatusVariant = () => getConnectionStatusVariant(connection.isActive, effectiveStatus, connection.banned);
+
+  const isBanned = connection.banned === true;
+  const [banPending, setBanPending] = useState(false);
+  const banTooltipText = [
+    connection.banReason || null,
+    connection.banRetryAt ? `Retry after ${connection.banRetryAt}` : (!connection.banRetryAt && isBanned ? "Skipped by routing until manually unbanned" : null),
+  ].filter(Boolean).join(" — ") || null;
+
+  const handleToggleBanned = async () => {
+    if (!onToggleBanned || banPending) return;
+    setBanPending(true);
+    try {
+      await onToggleBanned(!isBanned);
+    } finally {
+      setBanPending(false);
+    }
+  };
 
   const getOneByOneVariant = () => {
     if (!oneByOneStatus) return "default";
@@ -167,6 +184,15 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
             <Badge variant={getStatusVariant()} size="sm" dot>
               {connection.isActive === false ? "disabled" : (effectiveStatus || "Unknown")}
             </Badge>
+            {isBanned && (
+              <Tooltip text={banTooltipText || "Banned"}>
+                <span>
+                  <Badge variant="warning" size="sm" icon="block">
+                    banned
+                  </Badge>
+                </span>
+              </Tooltip>
+            )}
             <Badge variant="default" size="sm">
               {authLabel}
             </Badge>
@@ -176,9 +202,14 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
               </Badge>
             )}
             {isCooldown && connection.isActive !== false && <CooldownTimer until={modelLockUntil} />}
-            {connection.lastError && connection.isActive !== false && (
+            {connection.lastError && connection.isActive !== false && !isBanned && (
               <span className="max-w-full truncate text-xs text-red-500 sm:max-w-[300px]" title={connection.lastError}>
                 {connection.lastError}
+              </span>
+            )}
+            {isBanned && (connection.banReason || connection.banRetryAt) && (
+              <span className="max-w-full truncate text-xs text-yellow-600 dark:text-yellow-400 sm:max-w-[300px]" title={banTooltipText}>
+                {connection.banReason || `Retry after ${connection.banRetryAt}`}
               </span>
             )}
             <span className="text-xs text-text-muted">#{connection.priority}</span>
@@ -261,6 +292,18 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
             <span className="material-symbols-outlined text-[18px]">edit</span>
             <span className="text-[10px] leading-tight">Edit</span>
           </button>
+          {onToggleBanned && (
+            <Tooltip text={isBanned ? (banTooltipText || "Unban this account") : "Ban this account (excluded from routing)"}>
+              <button
+                onClick={handleToggleBanned}
+                disabled={banPending}
+                className={`flex flex-col items-center rounded px-2 py-1 transition-colors hover:bg-black/5 dark:hover:bg-white/5 ${isBanned ? "text-yellow-600 dark:text-yellow-400" : "text-text-muted hover:text-primary"} ${banPending ? "opacity-50 cursor-wait" : ""}`}
+              >
+                <span className="material-symbols-outlined text-[18px]">{banPending ? "progress_activity" : isBanned ? "lock_open" : "block"}</span>
+                <span className="text-[10px] leading-tight">{isBanned ? "Unban" : "Ban"}</span>
+              </button>
+            </Tooltip>
+          )}
           <button onClick={onDelete} className="flex flex-col items-center rounded px-2 py-1 text-red-500 hover:bg-red-500/10">
             <span className="material-symbols-outlined text-[18px]">delete</span>
             <span className="text-[10px] leading-tight">Delete</span>
@@ -270,7 +313,7 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
           size="sm"
           checked={connection.isActive ?? true}
           onChange={onToggleActive}
-          title={(connection.isActive ?? true) ? "Disable connection" : "Enable connection"}
+          title={isBanned ? "Banned: skipped by routing even while enabled" : (connection.isActive ?? true) ? "Disable connection" : "Enable connection"}
         />
       </div>
     </div>
@@ -286,6 +329,10 @@ ConnectionRow.propTypes = {
     modelLockUntil: PropTypes.string,
     testStatus: PropTypes.string,
     isActive: PropTypes.bool,
+    banned: PropTypes.bool,
+    bannedAt: PropTypes.string,
+    banReason: PropTypes.string,
+    banRetryAt: PropTypes.string,
     lastError: PropTypes.string,
     priority: PropTypes.number,
     globalPriority: PropTypes.number,
@@ -303,6 +350,7 @@ ConnectionRow.propTypes = {
   onMoveUp: PropTypes.func.isRequired,
   onMoveDown: PropTypes.func.isRequired,
   onToggleActive: PropTypes.func.isRequired,
+  onToggleBanned: PropTypes.func,
   onUpdateProxy: PropTypes.func,
   onEdit: PropTypes.func.isRequired,
   onDelete: PropTypes.func.isRequired,

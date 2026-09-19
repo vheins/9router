@@ -923,6 +923,32 @@ export default function ProviderDetailPage() {
     }
   };
 
+  const handleUpdateConnectionBanned = async (id, banned) => {
+    try {
+      const res = await fetch(`/api/providers/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ banned }),
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        const updated = data?.connection || null;
+        setConnections(prev => prev.map(c => c.id === id
+          ? (updated ? { ...c, ...updated } : {
+              ...c,
+              banned,
+              bannedAt: banned ? (c.bannedAt || new Date().toISOString()) : null,
+              banReason: banned ? (c.banReason || "Manually banned") : null,
+              banRetryAt: null,
+            })
+          : c
+        ));
+      }
+    } catch (error) {
+      console.log("Error updating connection banned state:", error);
+    }
+  };
+
   const handleSwapPriority = async (index1, index2) => {
     // Optimistic update state
     const newConnections = [...connections];
@@ -1069,6 +1095,7 @@ export default function ProviderDetailPage() {
                 onMoveUp={() => handleSwapPriority(index, index - 1)}
                 onMoveDown={() => handleSwapPriority(index, index + 1)}
                 onToggleActive={(isActive) => handleUpdateConnectionStatus(conn.id, isActive)}
+                onToggleBanned={(banned) => handleUpdateConnectionBanned(conn.id, banned)}
                 autoPing={AUTO_PING_SETTINGS_KEYS[providerId] && conn.authType === "oauth" ? {
                   on: autoPing.connections[conn.id] === true,
                   onToggle: (on) => handleAutoPingConnection(conn.id, on),
