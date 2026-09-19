@@ -13,6 +13,22 @@ import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { resolveCursorModels } from "open-sse/services/cursorModels.js";
 import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { resolveClineModels, resolveClinepassModels } from "open-sse/services/clinepassModels.js";
+import { markAccountUnavailable } from "@/sse/services/auth.js";
+
+/**
+ * Build an `onSuspension` callback for the Kiro model resolver. When discovery
+ * fails with a 403 the account is unusable for chat too, so mark it off (this
+ * reuses the same account-wide suspend logic as the chat path).
+ */
+function kiroSuspensionHandler(connection) {
+  return async ({ status, message }) => {
+    try {
+      await markAccountUnavailable(connection.id, status, message, "kiro", null);
+    } catch (e) {
+      console.log("Failed to mark Kiro account unavailable:", e?.message || e);
+    }
+  };
+}
 
 const GEMINI_CLI_MODELS_URL = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
 
@@ -370,6 +386,7 @@ const PROVIDER_MODELS_CONFIG = {
       try {
         const result = await resolveKiroModels(credentials, {
           log: console,
+          onSuspension: kiroSuspensionHandler(connection),
           onCredentialsRefreshed: async (refreshed) => {
             if (refreshed?.accessToken) {
               await updateProviderCredentials(connection.id, {

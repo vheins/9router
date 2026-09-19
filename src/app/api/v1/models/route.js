@@ -16,6 +16,7 @@ import { resolveGrokCliModels } from "open-sse/services/grokCliModels.js";
 import { resolveCursorModels } from "open-sse/services/cursorModels.js";
 import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
+import { markAccountUnavailable } from "@/sse/services/auth.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { capabilitiesFromServiceKind, getCapabilitiesForModel } from "open-sse/providers/capabilities.js";
 
@@ -28,7 +29,16 @@ const LIVE_MODEL_RESOLVERS = {
       accessToken: conn.accessToken,
       refreshToken: conn.refreshToken,
       providerSpecificData: conn.providerSpecificData || {}
-    }, { log: console });
+    }, {
+      log: console,
+      onSuspension: async ({ status, message }) => {
+        try {
+          await markAccountUnavailable(conn.id, status, message, "kiro", null);
+        } catch (e) {
+          console.log("Failed to mark Kiro account unavailable:", e?.message || e);
+        }
+      },
+    });
     return result?.models?.length ? { models: result.models } : null;
   },
   qoder: async (conn) => {

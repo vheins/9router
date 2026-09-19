@@ -217,6 +217,29 @@ function cacheKey(credentials) {
 }
 
 /**
+ * Report a model-discovery failure that indicates the account itself is
+ * unusable (403 suspension) so the caller can mark the credential off.
+ *
+ * Model discovery is a non-SSE path, but a suspended account must still be
+ * excluded from chat routing — otherwise every chat request keeps selecting a
+ * dead credential and the SSE fallback chain burns its turns on it. Errors
+ * other than suspension are ignored here (the caller already logs them).
+ *
+ * @param {Error & { status?: number, body?: string }} err
+ * @param {{ log?: object, onSuspension?: (info: { status: number, message: string }) => Promise<void>|void }} options
+ */
+async function notifySuspension(err, options = {}) {
+  const status = Number(err?.status);
+  if (status !== 403) return;
+  const message = err?.body || err?.message || "403 from Kiro";
+  try {
+    await options.onSuspension?.({ status, message });
+  } catch (e) {
+    options.log?.warn?.("KIRO_MODELS", `onSuspension failed: ${e?.message || e}`);
+  }
+}
+
+/**
  * Resolve the live Kiro model catalog for a credential and expand each entry
  * into 9router variants (`-thinking`, `-agentic`, `-thinking-agentic`).
  *
@@ -231,6 +254,8 @@ function cacheKey(credentials) {
  * @param {function} [options.onCredentialsRefreshed] Persist refreshed token
  *   back to your credential store. Called with `{ accessToken, refreshToken,
  *   expiresIn }` whenever a 401 triggers a token refresh.
+ * @param {function} [options.onSuspension] Called with `{ status, message }`
+ *   when discovery fails with a 403 so the caller can mark the account off.
  * @returns {Promise<{ models: object[], rawModels: object[] } | null>}
  */
 export async function resolveKiroModels(credentials, options = {}) {
@@ -274,6 +299,7 @@ export async function resolveKiroModels(credentials, options = {}) {
           if (next.refreshToken) credentials.refreshToken = next.refreshToken;
         } catch (err2) {
           options.log?.warn?.("KIRO_MODELS", `Retry after refresh failed: ${err2?.message || err2}`);
+          await notifySuspension(err2, options);
           return null;
         }
       } else {
@@ -282,6 +308,9 @@ export async function resolveKiroModels(credentials, options = {}) {
       }
     } else {
       options.log?.warn?.("KIRO_MODELS", `ListAvailableModels failed: ${err?.message || err}`);
+      // A 403 suspension must still mark the account so chat routing skips it —
+      // model discovery failing is a symptom, not the blocker.
+      await notifySuspension(err, options);
       return null;
     }
   }

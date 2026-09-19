@@ -25,6 +25,73 @@ function githubMonthlyResetMs(status, errorText, provider) {
   return Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
 }
 
+/**
+ * Parse the suspend-until time out of a 403 error message.
+ *
+ * Providers like Kiro/AWS return "temporarily suspended ... until <time>" (or a
+ * bare "until <ISO time>"). When a concrete expiry is present the account must
+ * stay off until that moment — retrying every 2 minutes just burns the fallback
+ * chain. Returns epoch ms, or null when no usable future time is present (the
+ * caller then falls back to the generic rule / permanent auto-off).
+ *
+ * Recognized shapes:
+ * - "suspended until 2026-09-20T10:00:00Z"
+ * - "suspended until 2026-09-20 10:00:00 UTC"
+ * - "suspended until 2026/09/20 10:00:00"
+ * - "until 2026-09-20T10:00:00Z"
+ * - "suspended until 1789000000" (unix seconds/ms)
+ */
+export function parseSuspendUntil(errorText) {
+  if (!errorText || typeof errorText !== "string") return null;
+  const text = errorText.toLowerCase();
+  const now = Date.now();
+  // Allow a small past-skew window so a clock-skewed "just now" still parses.
+  const minMs = now - 60 * 1000;
+  const maxMs = now + 365 * 24 * 60 * 60 * 1000;
+
+  // Capture the datetime plus an optional timezone marker. Provider suspension
+  // messages are emitted in UTC, so a naive datetime is interpreted as UTC.
+  const patterns = [
+    /(?:until|after|at)\s+(\d{4}-\d{2}-\d{2}[t\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s*(z|utc|gmt)?/i,
+    /(?:until|after|at)\s+(\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2})\s*(z|utc|gmt)?/i,
+    /(?:until|after|at)\s+(\d{10,13})/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match || !match[1]) continue;
+    const raw = match[1];
+
+    // Unix timestamp (seconds or milliseconds).
+    if (/^\d{10,13}$/.test(raw)) {
+      const n = Number(raw);
+      const ms = raw.length === 10 ? n * 1000 : n;
+      if (ms > minMs && ms < maxMs) return ms;
+      continue;
+    }
+
+    // ISO / slash datetime → normalize to "YYYY-MM-DDTHH:mm:ssZ" (UTC).
+    // The source text is lowercased, so restore the uppercase "T" separator.
+    const iso = raw.replace(/\//g, "-").replace(/\s+/, "T").replace(/t/, "T").replace(/z$/i, "");
+    const parsed = new Date(`${iso}Z`);
+    if (!Number.isNaN(parsed.getTime()) && parsed.getTime() > minMs && parsed.getTime() < maxMs) {
+      return parsed.getTime();
+    }
+  }
+  return null;
+}
+
+/**
+ * Detect whether a 403 means the account is suspended (not a request-scoped or
+ * transient permission error). Used to decide between a bounded suspend window
+ * and an indefinite auto-off.
+ */
+export function isSuspension403(status, errorText) {
+  if (Number(status) !== 403) return false;
+  const t = String(errorText || "").toLowerCase();
+  return t.includes("suspend") || t.includes("locked") || t.includes("unusual user activity") || t.includes("security precaution");
+}
+
 // Build routing-engine targets from available connections. Missing fields stay
 // undefined so the engine degrades gracefully (keeps the caller's order).
 // `quotaSnapshots` is an optional Map<connectionId, persistedSnapshot> from the
@@ -379,24 +446,65 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
 
   // Provider-specific precise cooldown (e.g. codex usage_limit_reached resets_at) overrides backoff
   let shouldFallback, cooldownMs, newBackoffLevel;
-  if (githubResetAtMs) {
-    shouldFallback = true;
-    cooldownMs = githubResetAtMs - Date.now();
-    newBackoffLevel = 0;
-  } else if (resetsAtMs && resetsAtMs > Date.now()) {
-    shouldFallback = true;
-    // Antigravity quota API provides exact per-model resetAt. Do not truncate it.
-    cooldownMs = resolveProviderId(provider) === "antigravity"
-      ? resetsAtMs - Date.now()
-      : Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
-    newBackoffLevel = 0;
-  } else {
-    ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel));
+  let suspendUntilMs = null;
+  let isSuspended = false;
+  let permanentOff = false;
+
+  // 403 suspension handling — an explicit "until <time>" pins the account off
+  // until that moment; a suspension with no usable time is treated as an
+  // indefinite auto-off (long cooldown) instead of a 2-minute retry loop that
+  // would keep hammering a clearly-dead credential.
+  if (isSuspension403(status, errorText)) {
+    suspendUntilMs = parseSuspendUntil(errorText);
+    if (suspendUntilMs && suspendUntilMs > Date.now()) {
+      isSuspended = true;
+      const cooldownFromSuspend = suspendUntilMs - Date.now();
+      const maxCooldown = 30 * 24 * 60 * 60 * 1000; // 30 days
+      const minCooldown = 60 * 60 * 1000;           // 1 hour
+      cooldownMs = Math.max(minCooldown, Math.min(cooldownFromSuspend, maxCooldown));
+      shouldFallback = true;
+      newBackoffLevel = 0;
+      log.warn("AUTH", `Account suspended until ${new Date(suspendUntilMs).toISOString()}, auto-off for ${Math.round(cooldownMs / 1000 / 60)}m`);
+    } else {
+      // Suspended but no parseable expiry → auto-off for a long, bounded window
+      // (24h). Long enough to stop the retry storm; still self-heals daily so a
+      // transient suspension cannot silently kill the credential forever.
+      isSuspended = true;
+      permanentOff = true;
+      cooldownMs = 24 * 60 * 60 * 1000;
+      shouldFallback = true;
+      newBackoffLevel = 0;
+      log.warn("AUTH", `Account suspended with no expiry, auto-off for 24h [${status}]`);
+    }
   }
-  if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
+
+  if (!isSuspended) {
+    // GitHub premium-request exhaustion is account-wide until the next UTC month.
+    const githubResetAtMs = githubMonthlyResetMs(status, errorText, provider);
+
+    if (githubResetAtMs) {
+      shouldFallback = true;
+      cooldownMs = githubResetAtMs - Date.now();
+      newBackoffLevel = 0;
+    } else if (resetsAtMs && resetsAtMs > Date.now()) {
+      shouldFallback = true;
+      // Antigravity quota API provides exact per-model resetAt. Do not truncate it.
+      cooldownMs = resolveProviderId(provider) === "antigravity"
+        ? resetsAtMs - Date.now()
+        : Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
+      newBackoffLevel = 0;
+    } else {
+      ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel));
+    }
+    if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
+  }
 
   const reason = typeof errorText === "string" ? errorText.slice(0, 200) : "Provider error";
-  const lockUpdate = buildModelLockUpdate(githubResetAtMs ? null : model, cooldownMs);
+  // Suspensions lock the WHOLE account (model=null → modelLock___all) because a
+  // suspended credential is unusable for every model, not just the one that hit
+  // it. Other errors keep the per-model lock.
+  const lockModel = isSuspended ? null : (githubMonthlyResetMs(status, errorText, provider) ? null : model);
+  const lockUpdate = buildModelLockUpdate(lockModel, cooldownMs);
 
   await updateProviderConnection(connectionId, {
     ...lockUpdate,
@@ -404,7 +512,10 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     lastError: reason,
     errorCode: status,
     lastErrorAt: new Date().toISOString(),
-    backoffLevel: newBackoffLevel ?? backoffLevel
+    backoffLevel: newBackoffLevel ?? backoffLevel,
+    // Persist suspend info for routing accuracy (null clears it on normal errors).
+    suspendedUntil: isSuspended ? new Date(Date.now() + cooldownMs).toISOString() : null,
+    suspendIndefinite: permanentOff ? true : null
   });
 
   const lockKey = Object.keys(lockUpdate)[0];
@@ -415,7 +526,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     console.error(`❌ ${provider} [${status}]: ${reason}`);
   }
 
-  return { shouldFallback: true, cooldownMs };
+  return { shouldFallback: true, cooldownMs, suspendedUntil: isSuspended ? Date.now() + cooldownMs : null };
 }
 
 /**

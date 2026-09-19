@@ -23,6 +23,10 @@ function resetHealthStateOnActivation(existing, patch) {
     errorCode: null,
     rateLimitedUntil: null,
     backoffLevel: 0,
+    // A successful request proves the credential works again — drop any
+    // suspension markers alongside the model locks.
+    suspendedUntil: null,
+    suspendIndefinite: null,
   };
 
   for (const key of Object.keys(existing || {})) {
