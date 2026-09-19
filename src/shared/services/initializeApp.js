@@ -130,6 +130,12 @@ async function runHeavyStartup() {
   import("@/shared/services/routingStatePersistence")
     .then(({ initRoutingStatePersistence }) => initRoutingStatePersistence())
     .catch((e) => console.log("[RoutingState] persistence init failed:", e.message));
+
+  // Per-connection 24h metrics for the `auto` routing strategy. Refreshed on a
+  // timer so routing reads a warm in-memory cache instead of querying per request.
+  import("@/shared/services/connectionMetricsScheduler")
+    .then(({ startConnectionMetricsScheduler }) => startConnectionMetricsScheduler())
+    .catch((e) => console.log("[ConnectionMetrics] scheduler start failed:", e.message));
 }
 
 function hasQuotaAutoPingEnabled(settings) {

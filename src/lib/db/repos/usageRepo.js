@@ -15,7 +15,11 @@ const CONN_CACHE_TTL_MS = 30 * 1000;
 const PERIOD_MS = { "24h": 86400000, "7d": 604800000, "30d": 2592000000, "60d": 5184000000 };
 
 // In-memory state shared across Next.js modules
-if (!global._pendingRequests) global._pendingRequests = { byModel: {}, byAccount: {} };
+// byCombo is nested `{ [connectionId]: { [modelKey]: { [comboName]: count } } }`
+// so combo names never need delimiter escaping. It attributes in-flight requests
+// to the combo that originated them, for the 9Router → combo → provider → model path.
+if (!global._pendingRequests) global._pendingRequests = { byModel: {}, byAccount: {}, byCombo: {} };
+if (!global._pendingRequests.byCombo) global._pendingRequests.byCombo = {};
 if (!global._lastErrorProvider) global._lastErrorProvider = { provider: "", ts: 0 };
 if (!global._statsEmitter) {
   global._statsEmitter = new EventEmitter();
@@ -228,9 +232,26 @@ async function calculateCost(provider, model, tokens) {
   }
 }
 
-export function trackPendingRequest(model, provider, connectionId, started, error = false) {
+/**
+ * Track an in-flight request.
+ *
+ * Backward compatible: the optional trailing `comboName` attributes the request
+ * to the combo that originated it (nested combos included). Callers that omit it
+ * keep the previous behavior exactly.
+ *
+ * @param {string} model
+ * @param {string} provider
+ * @param {string} connectionId
+ * @param {boolean} started - true on dispatch, false on completion
+ * @param {boolean} [error=false]
+ * @param {string|null} [comboName=null]
+ */
+export function trackPendingRequest(model, provider, connectionId, started, error = false, comboName = null) {
   const modelKey = provider ? `${model} (${provider})` : model;
   const timerKey = `${connectionId}|${modelKey}`;
+  const combo = typeof comboName === "string" && comboName.trim() ? comboName.trim() : null;
+  // Combo attribution is only meaningful when the request is tied to a connection.
+  const hasComboContext = !!(combo && connectionId);
 
   if (!pendingRequests.byModel[modelKey]) pendingRequests.byModel[modelKey] = 0;
   pendingRequests.byModel[modelKey] = Math.max(0, pendingRequests.byModel[modelKey] + (started ? 1 : -1));
@@ -248,6 +269,22 @@ export function trackPendingRequest(model, provider, connectionId, started, erro
     }
   }
 
+  if (hasComboContext) {
+    if (!pendingRequests.byCombo) pendingRequests.byCombo = {};
+    const byCombo = pendingRequests.byCombo;
+    const current = byCombo[connectionId]?.[modelKey]?.[combo] || 0;
+    const next = Math.max(0, current + (started ? 1 : -1));
+    if (next === 0) {
+      delete byCombo[connectionId]?.[modelKey]?.[combo];
+      if (byCombo[connectionId]?.[modelKey] && Object.keys(byCombo[connectionId][modelKey]).length === 0) delete byCombo[connectionId][modelKey];
+      if (byCombo[connectionId] && Object.keys(byCombo[connectionId]).length === 0) delete byCombo[connectionId];
+    } else {
+      if (!byCombo[connectionId]) byCombo[connectionId] = {};
+      if (!byCombo[connectionId][modelKey]) byCombo[connectionId][modelKey] = {};
+      byCombo[connectionId][modelKey][combo] = next;
+    }
+  }
+
   if (started) {
     clearTimeout(pendingTimers[timerKey]);
     pendingTimers[timerKey] = setTimeout(() => {
@@ -255,6 +292,12 @@ export function trackPendingRequest(model, provider, connectionId, started, erro
       if (pendingRequests.byModel[modelKey] > 0) pendingRequests.byModel[modelKey] = 0;
       if (connectionId && pendingRequests.byAccount[connectionId]?.[modelKey] > 0) {
         pendingRequests.byAccount[connectionId][modelKey] = 0;
+      }
+      if (hasComboContext) {
+        const byCombo = pendingRequests.byCombo;
+        delete byCombo?.[connectionId]?.[modelKey]?.[combo];
+        if (byCombo?.[connectionId]?.[modelKey] && Object.keys(byCombo[connectionId][modelKey]).length === 0) delete byCombo[connectionId][modelKey];
+        if (byCombo?.[connectionId] && Object.keys(byCombo[connectionId]).length === 0) delete byCombo[connectionId];
       }
       scheduleStatsEvent("pending");
     }, PENDING_TIMEOUT_MS);
@@ -283,23 +326,61 @@ export function getConnectionActiveCount(connectionId) {
   return total;
 }
 
-export async function getActiveRequests() {
+// Build the active-request list from the in-memory tracker, attributing each
+// entry to its originating combo (with the resolved nested chain when known).
+// Shared by getActiveRequests() and getUsageStats() so both expose the same shape.
+async function collectActiveRequests(connectionMap) {
   const activeRequests = [];
-  const connectionMap = await getConnectionMapCached();
+
+  // Combo attribution: byCombo is `{ [connectionId]: { [modelKey]: { [combo]: count } } }`.
+  // Resolve chains lazily so the DB layer stays free of engine imports on the
+  // hot path, and fail-open when the combo registry is unreadable.
+  // If several combos hit the same connection/model concurrently, the busiest wins.
+  const comboByKey = new Map();
+  for (const [connectionId, models] of Object.entries(pendingRequests.byCombo || {})) {
+    for (const [modelKey, combos] of Object.entries(models || {})) {
+      for (const [combo, count] of Object.entries(combos || {})) {
+        if (!(count > 0)) continue;
+        const key = `${connectionId}|${modelKey}`;
+        const current = comboByKey.get(key);
+        if (!current || count > current.count) comboByKey.set(key, { combo, count });
+      }
+    }
+  }
+  let comboChains = new Map();
+  if (comboByKey.size > 0) {
+    try {
+      const { getComboChainMap } = await import("@/lib/comboTopology.js");
+      comboChains = await getComboChainMap();
+    } catch {
+      // fail-open: active requests keep working without chain info
+    }
+  }
 
   for (const [connectionId, models] of Object.entries(pendingRequests.byAccount)) {
     for (const [modelKey, count] of Object.entries(models)) {
       if (count > 0) {
         const accountName = connectionMap[connectionId] || `Account ${connectionId.slice(0, 8)}...`;
         const match = modelKey.match(/^(.*) \((.*)\)$/);
+        const combo = comboByKey.get(`${connectionId}|${modelKey}`)?.combo || null;
+        const chain = combo ? (comboChains.get(combo)?.chain || [combo]) : [];
         activeRequests.push({
           model: match ? match[1] : modelKey,
           provider: match ? match[2] : "unknown",
           account: accountName, count,
+          combo,
+          comboChain: chain,
         });
       }
     }
   }
+
+  return activeRequests;
+}
+
+export async function getActiveRequests() {
+  const connectionMap = await getConnectionMapCached();
+  const activeRequests = await collectActiveRequests(connectionMap);
 
   await ensureRingInitialized();
   const seen = new Set();
@@ -447,6 +528,112 @@ export async function recordRequestError(entry = {}) {
   }
 }
 
+// ── Per-connection 24h rolling metrics (auto routing) ────────────────────────
+// The `auto` strategy scores connections on recent throughput/health. Aggregating
+// usageHistory is too heavy for the request path, so the result is cached and
+// refreshed on a scheduler tick (see src/shared/services/connectionMetricsScheduler.js).
+// Reads never trigger a query: callers use getConnectionMetrics24hCached().
+export const CONNECTION_METRICS_WINDOW_MS = 24 * 60 * 60 * 1000;
+const CONNECTION_METRICS_TTL_MS = 60 * 1000;
+const CONNECTION_METRICS_MINUTES = CONNECTION_METRICS_WINDOW_MS / 60000;
+
+if (!global._connectionMetricsCache) {
+  global._connectionMetricsCache = { map: {}, ts: 0, inflight: null };
+}
+const connectionMetricsCache = global._connectionMetricsCache;
+
+/**
+ * Recompute the per-connection 24h metrics map and swap it into the cache.
+ *
+ * Mirrors the per-user aggregation math (addUserRow + the byUser finalize loop):
+ * latency averages only count successful rows that recorded totalMs > 0; TPS is
+ * summed output tokens over summed wall time (not per-request averages); RPM is
+ * requests over the fixed 24h window. Fail-open: on error the previous cache is
+ * kept. Concurrent callers share one in-flight query.
+ *
+ * @param {{ force?: boolean }} [opts] - force bypasses the short TTL guard
+ * @returns {Promise<Record<string, object>>} connectionId → metrics
+ */
+export async function refreshConnectionMetrics24h({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && connectionMetricsCache.ts && now - connectionMetricsCache.ts < CONNECTION_METRICS_TTL_MS) {
+    return connectionMetricsCache.map;
+  }
+  if (connectionMetricsCache.inflight) return connectionMetricsCache.inflight;
+
+  const task = (async () => {
+    try {
+      const db = await getAdapter();
+      const cutoff = new Date(Date.now() - CONNECTION_METRICS_WINDOW_MS).toISOString();
+      const rows = await db.all(
+        `SELECT connectionId,
+                COUNT(*) AS requests,
+                SUM(CASE WHEN LOWER(COALESCE(status, 'ok')) = 'error' THEN 1 ELSE 0 END) AS errorRequests,
+                SUM(CASE WHEN LOWER(COALESCE(status, 'ok')) != 'error' THEN COALESCE(promptTokens, 0) ELSE 0 END) AS promptTokens,
+                SUM(CASE WHEN LOWER(COALESCE(status, 'ok')) != 'error' THEN COALESCE(completionTokens, 0) ELSE 0 END) AS completionTokens,
+                SUM(CASE WHEN LOWER(COALESCE(status, 'ok')) != 'error' AND totalMs > 0 THEN COALESCE(ttftMs, 0) ELSE 0 END) AS sumTtft,
+                SUM(CASE WHEN LOWER(COALESCE(status, 'ok')) != 'error' AND totalMs > 0 THEN totalMs ELSE 0 END) AS sumTotal,
+                SUM(CASE WHEN LOWER(COALESCE(status, 'ok')) != 'error' AND totalMs > 0 THEN COALESCE(completionTokens, 0) ELSE 0 END) AS sampledCompletionTokens,
+                SUM(CASE WHEN LOWER(COALESCE(status, 'ok')) != 'error' AND totalMs > 0 THEN 1 ELSE 0 END) AS latencySamples,
+                MAX(CASE WHEN LOWER(COALESCE(status, 'ok')) != 'error' THEN timestamp END) AS lastSuccessAt,
+                MAX(CASE WHEN LOWER(COALESCE(status, 'ok')) = 'error' THEN timestamp END) AS lastErrorAt
+         FROM usageHistory
+         WHERE connectionId IS NOT NULL AND connectionId != '' AND timestamp >= ?
+         GROUP BY connectionId`,
+        [cutoff]
+      );
+
+      const map = {};
+      for (const r of rows) {
+        const requests = Number(r.requests) || 0;
+        const latencySamples = Number(r.latencySamples) || 0;
+        const sumTotal = Number(r.sumTotal) || 0;
+        const completionTokens = Number(r.completionTokens) || 0;
+        const totalTokens = (Number(r.promptTokens) || 0) + completionTokens;
+        map[r.connectionId] = {
+          avgTtftMs: latencySamples ? Math.round((Number(r.sumTtft) || 0) / latencySamples) : null,
+          avgTotalMs: latencySamples ? Math.round(sumTotal / latencySamples) : null,
+          // Output tokens over summed wall time (NOT summed tokens / averaged time,
+          // which would inflate TPS by the sample count).
+          tps: sumTotal > 0 ? Number(((Number(r.sampledCompletionTokens) || 0) / (sumTotal / 1000)).toFixed(2)) : null,
+          tokensPerReq: requests ? Math.round(totalTokens / requests) : null,
+          rpm: Number((requests / CONNECTION_METRICS_MINUTES).toFixed(4)),
+          lastSuccessAt: r.lastSuccessAt || null,
+          lastErrorAt: r.lastErrorAt || null,
+          sampleCount: latencySamples,
+        };
+      }
+
+      connectionMetricsCache.map = map;
+      connectionMetricsCache.ts = Date.now();
+      return map;
+    } catch (e) {
+      console.warn("[usageRepo] connection metrics refresh failed:", e?.message || e);
+      return connectionMetricsCache.map; // fail-open: keep the last known map
+    }
+  })();
+
+  connectionMetricsCache.inflight = task;
+  try {
+    return await task;
+  } finally {
+    if (connectionMetricsCache.inflight === task) connectionMetricsCache.inflight = null;
+  }
+}
+
+/**
+ * Synchronously read the cached per-connection 24h metrics.
+ *
+ * Never touches the DB. Returns an empty object until the first refresh (the
+ * scheduler primes it at boot), so routing degrades gracefully to neutral
+ * defaults instead of blocking the request path.
+ *
+ * @returns {Record<string, object>} connectionId → metrics
+ */
+export function getConnectionMetrics24hCached() {
+  return connectionMetricsCache.map;
+}
+
 async function loadDaysInRange(adapter, maxDays) {
   if (maxDays == null) {
     return await adapter.all(`SELECT dateKey, data FROM usageDaily`);
@@ -517,20 +704,8 @@ export async function getUsageStats(period = "all") {
     errorProvider: (Date.now() - lastErrorProvider.ts < 10000) ? lastErrorProvider.provider : "",
   };
 
-  // Active requests
-  for (const [connectionId, models] of Object.entries(pendingRequests.byAccount)) {
-    for (const [modelKey, count] of Object.entries(models)) {
-      if (count > 0) {
-        const accountName = connectionMap[connectionId] || `Account ${connectionId.slice(0, 8)}...`;
-        const match = modelKey.match(/^(.*) \((.*)\)$/);
-        stats.activeRequests.push({
-          model: match ? match[1] : modelKey,
-          provider: match ? match[2] : "unknown",
-          account: accountName, count,
-        });
-      }
-    }
-  }
+  // Active requests (shared with getActiveRequests so combo attribution is consistent)
+  stats.activeRequests = await collectActiveRequests(connectionMap);
 
   // last10Minutes — query 10min window
   const now = new Date();

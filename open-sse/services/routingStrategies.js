@@ -28,6 +28,13 @@
 //   testStatus          string  "active" | "unavailable" | ... (auto)
 //   lastUsedAt          string|number  ISO or epoch (recency/auto)
 //   lastSuccessAt       string|number  ISO or epoch (lkgp)
+//   avgTtftMs           number  24h avg time-to-first-token (auto; lower better)
+//   avgTotalMs          number  24h avg total wall time (auto)
+//   tps                 number  24h output tokens/sec (auto; higher better)
+//   tokensPerReq        number  24h avg output tokens/request (auto)
+//   rpm                 number  24h requests/min (auto)
+//   lastSuccess24hAt    string|number  ISO or epoch of last 24h success (auto)
+//   lastError24hAt      string|number  ISO or epoch of last 24h error (auto)
 
 import { routingStateStore } from "./routingStateStore.js";
 
@@ -218,11 +225,45 @@ function lkgpOrder(list, lastGoodKey) {
   return [good, ...out];
 }
 
+// Recency window for the 24h metrics block. Mirrors the aggregator's rolling
+// window; kept local because this module stays free of src/ imports.
+const METRICS_RECENCY_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+// Numeric metric extraction. `num()` alone would coerce null → 0, which for a
+// lower-is-better metric (latency) would score an unsampled target as best.
+// Null / undefined / "" are therefore treated as absent and yield the fallback.
+function metricNum(v, fallback) {
+  if (v === null || v === undefined || v === "") return fallback;
+  return num(v, fallback);
+}
+
+// Fraction of the window still "fresh": 1 at the event, 0 at the window edge.
+// Returns null when the timestamp is missing/invalid so callers can pick a default.
+function recencyFraction(v, nowMs) {
+  const at = ts(v);
+  if (at === null) return null;
+  const age = nowMs - at;
+  if (!Number.isFinite(age)) return null;
+  if (age <= 0) return 1;
+  return Math.max(0, 1 - age / METRICS_RECENCY_WINDOW_MS);
+}
+
 // auto: weighted multi-factor score. Higher = better. All factors normalized
 // within the candidate set so the score is comparable.
+//
+// Weight budget (maximum points contributed by each factor):
+//   base:      successRate 30 · cost 15 · latency 10 · quota 15 · usage 10 ·
+//              priority 10 · errors -5 each · health +5/-10
+//   24h block: avgTtftMs 6 · avgTotalMs 4 · tps 6 · tokensPerReq 3 · rpm 3 ·
+//              lastSuccess24hAt +4 · lastError24hAt -4
+// The 24h block is additive and bounded so the existing weights stay dominant.
+// A metric absent from every candidate contributes its neutral half (or 0 for
+// the recency terms); a metric absent from ONE candidate is treated as the
+// set-worst value, matching the existing cost/latency convention.
 function autoScore(t, ctx) {
   const set = ctx?._set || [];
   const norm = (v, min, max) => (max > min ? (v - min) / (max - min) : 0.5);
+  const nowMs = Number.isFinite(ctx?.nowMs) ? ctx.nowMs : Date.now();
 
   const costs = set.map(costOf).filter(Number.isFinite);
   const lats = set.map((x) => num(x.latencyMs, NaN)).filter(Number.isFinite);
@@ -258,6 +299,57 @@ function autoScore(t, ctx) {
     const p = num(t.priority, 999);
     score += (1 - norm(p, Math.min(...prios), Math.max(...prios))) * 10;
   }
+
+  // ── 24h rolling metrics (additive block, see weight budget above) ──────────
+  // Latency metrics (lower better) use the same "absent → set-worst" convention
+  // as cost/latency above, so an unsampled connection cannot outrank a sampled one.
+  const ttfts = set.map((x) => metricNum(x.avgTtftMs, NaN)).filter(Number.isFinite);
+  const totals = set.map((x) => metricNum(x.avgTotalMs, NaN)).filter(Number.isFinite);
+  const tpsVals = set.map((x) => metricNum(x.tps, NaN)).filter(Number.isFinite);
+  const tprVals = set.map((x) => metricNum(x.tokensPerReq, NaN)).filter(Number.isFinite);
+  const rpms = set.map((x) => metricNum(x.rpm, NaN)).filter(Number.isFinite);
+
+  // Avg TTFT — faster is better (0..6)
+  if (ttfts.length) {
+    const v = metricNum(t.avgTtftMs, Math.max(...ttfts));
+    score += (1 - norm(v, Math.min(...ttfts), Math.max(...ttfts))) * 6;
+  } else {
+    score += 3;
+  }
+  // Avg total — faster is better (0..4)
+  if (totals.length) {
+    const v = metricNum(t.avgTotalMs, Math.max(...totals));
+    score += (1 - norm(v, Math.min(...totals), Math.max(...totals))) * 4;
+  } else {
+    score += 2;
+  }
+  // Throughput (TPS) — higher is better (0..6)
+  if (tpsVals.length) {
+    const v = metricNum(t.tps, 0);
+    score += norm(v, Math.min(...tpsVals), Math.max(...tpsVals)) * 6;
+  } else {
+    score += 3;
+  }
+  // Tokens per request (0..3): neutral, no directional preference.
+  if (tprVals.length) {
+    const v = metricNum(t.tokensPerReq, 0);
+    score += norm(v, Math.min(...tprVals), Math.max(...tprVals)) * 3;
+  } else {
+    score += 1.5;
+  }
+  // RPM (0..3): neutral, no directional preference.
+  if (rpms.length) {
+    const v = metricNum(t.rpm, 0);
+    score += norm(v, Math.min(...rpms), Math.max(...rpms)) * 3;
+  } else {
+    score += 1.5;
+  }
+  // Recency of last 24h success / error — no samples → 0 (no bonus/penalty).
+  const successRecency = recencyFraction(t.lastSuccess24hAt, nowMs);
+  if (successRecency !== null) score += successRecency * 4;
+  const errorRecency = recencyFraction(t.lastError24hAt, nowMs);
+  if (errorRecency !== null) score -= errorRecency * 4;
+
   // Error penalty
   score -= num(t.consecutiveErrors, 0) * 5;
   // Health

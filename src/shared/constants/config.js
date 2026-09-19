@@ -102,6 +102,14 @@ export const QUOTA_AUTO_TOGGLE_CONFIG = {
   providerMinIntervalMs: { claude: 600000 },
 };
 
+// Connection metrics: background refresh of the per-connection 24h rolling
+// metrics (Avg TTFT / Avg Total / TPS / Tok per Req / RPM / last success+error)
+// that the `auto` routing strategy scores. Kept out of the request path.
+export const CONNECTION_METRICS_CONFIG = {
+  refreshIntervalMs: 60000,          // refresh cache every 60s
+  initialDelayMs: 2000,              // let boot settle before the first query
+};
+
 // Re-export from providers.js for backward compatibility
 export {
   FREE_PROVIDERS,
