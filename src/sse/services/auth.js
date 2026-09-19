@@ -1,5 +1,5 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools, getQuotaSnapshots } from "@/lib/localDb";
-import { getConnectionActiveCount } from "@/lib/usageDb.js";
+import { getConnectionActiveCount, getConnectionMetrics24hCached } from "@/lib/usageDb.js";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { orderTargets, quotaAwareOrder, isSelectionStrategy } from "open-sse/services/routingStrategies.js";
@@ -92,12 +92,44 @@ export function isSuspension403(status, errorText) {
   return t.includes("suspend") || t.includes("locked") || t.includes("unusual user activity") || t.includes("security precaution");
 }
 
+// Default ban window when a suspension 403 carries no parseable expiry. The
+// account is re-probed after this window; a successful request clears the ban.
+const BAN_RETRY_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Whether a connection's persistent ban still excludes it from routing.
+ *
+ * A ban with no usable `banRetryAt` is indefinite (manual ban). Once
+ * `banRetryAt` has passed the ban is "due" and no longer excludes the account,
+ * so the next request acts as a probe: success clears the ban, another 403
+ * extends it. Never throws — a malformed value must not break account selection.
+ *
+ * @param {object} conn - connection record (data JSON merged)
+ * @param {number} [nowMs]
+ * @returns {boolean}
+ */
+export function isBanActive(conn, nowMs = Date.now()) {
+  try {
+    if (!conn?.banned) return false;
+    if (!conn.banRetryAt) return true;
+    const retryAt = new Date(conn.banRetryAt).getTime();
+    if (!Number.isFinite(retryAt)) return true;
+    return retryAt > nowMs;
+  } catch {
+    return false; // fail-open: a ban-check error must not block routing
+  }
+}
+
 // Build routing-engine targets from available connections. Missing fields stay
 // undefined so the engine degrades gracefully (keeps the caller's order).
 // `quotaSnapshots` is an optional Map<connectionId, persistedSnapshot> from the
 // FORK-ONLY quotaTracker table — its values fill in quotaRemainingPct/resetAtMs
 // for any connection the in-memory Antigravity cache doesn't cover.
 function connectionsToTargets(connections, { isAntigravity, model, antigravityQuotaCache, quotaSnapshots }) {
+  // Per-connection 24h rolling metrics for the `auto` strategy. Read from the
+  // scheduler-warmed cache (no query); an empty cache yields undefined fields so
+  // the scorer degrades to neutral defaults.
+  const metrics24h = getConnectionMetrics24hCached();
   return connections.map((c) => {
     let quotaRemainingPct;
     let resetAtMs;
@@ -125,6 +157,7 @@ function connectionsToTargets(connections, { isAntigravity, model, antigravityQu
     // `auto`. Prefer the live store, but fall back to the connection's own
     // persisted fields so ordering is unchanged when stats are absent.
     const st = routingStateStore.getStats(c.id);
+    const m24 = metrics24h[c.id];
     return {
       key: c.id,
       priority: c.priority,
@@ -141,6 +174,14 @@ function connectionsToTargets(connections, { isAntigravity, model, antigravityQu
       quotaRemainingPct,
       resetAtMs,
       quotaUnlimited,
+      // 24h rolling metrics (undefined when no samples → scorer uses neutral defaults)
+      avgTtftMs: m24?.avgTtftMs ?? undefined,
+      avgTotalMs: m24?.avgTotalMs ?? undefined,
+      tps: m24?.tps ?? undefined,
+      tokensPerReq: m24?.tokensPerReq ?? undefined,
+      rpm: m24?.rpm ?? undefined,
+      lastSuccess24hAt: m24?.lastSuccessAt ?? undefined,
+      lastError24hAt: m24?.lastErrorAt ?? undefined,
     };
   });
 }
@@ -230,9 +271,13 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const isAntigravity = providerId === "antigravity";
     const antigravityQuotaCache = isAntigravity && model ? getAntigravityQuotaCache() : null;
 
-    // Filter out model-locked, excluded, and Antigravity quota-exhausted connections.
+    // Filter out banned, model-locked, excluded, and Antigravity
+    // quota-exhausted connections. A banned connection whose banRetryAt has
+    // passed is kept as a probe candidate: success clears the ban, another 403
+    // extends it.
     const availableConnections = connections.filter(c => {
       if (excludeSet.has(c.id)) return false;
+      if (isBanActive(c)) return false;
       if (isModelLockActive(c, model)) return false;
       // Antigravity: skip if live quota exhausted for this model
       if (isAntigravity && model && antigravityQuotaCache) {
@@ -249,14 +294,39 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     log.debug("AUTH", `${provider} | available: ${availableConnections.length}/${connections.length}`);
     connections.forEach(c => {
       const excluded = excludeSet.has(c.id);
+      const banned = isBanActive(c);
       const locked = isModelLockActive(c, model);
-      if (excluded || locked) {
+      if (excluded || banned || locked) {
         const lockUntil = getEarliestModelLockUntil(c);
-        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${locked ? `modelLocked(${model}) until ${lockUntil}` : ""}`);
+        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${banned ? `banned(until ${c.banRetryAt || "manual unban"})` : ""} ${locked ? `modelLocked(${model}) until ${lockUntil}` : ""}`);
       }
     });
 
     if (availableConnections.length === 0) {
+      // A persistent ban is the authoritative exclusion — surface it (and its
+      // retry timing) before falling back to lock/quota reporting so callers
+      // can say "banned" rather than the generic "unavailable". Only
+      // non-excluded accounts count: an already-tried banned account must not
+      // mask the real reason the remaining accounts are unavailable.
+      const activeBans = connections.filter(c => !excludeSet.has(c.id) && isBanActive(c));
+      if (activeBans.length > 0) {
+        const banExpiries = activeBans
+          .map(c => c.banRetryAt)
+          .filter(v => v && Number.isFinite(new Date(v).getTime()))
+          .sort((a, b) => new Date(a) - new Date(b));
+        const earliestBan = banExpiries[0] || null;
+        const banHuman = earliestBan ? formatRetryAfter(earliestBan) : "manual unban required";
+        log.warn("AUTH", `${provider} | all ${connections.length} accounts banned (${banHuman}) | lastError=${activeBans[0]?.banReason?.slice(0, 50)}`);
+        return {
+          allRateLimited: true,
+          banned: true,
+          retryAfter: earliestBan,
+          retryAfterHuman: banHuman,
+          lastError: activeBans[0]?.banReason || activeBans[0]?.lastError || null,
+          lastErrorCode: activeBans[0]?.errorCode || null
+        };
+      }
+
       // Find earliest persistent lock or lazy Antigravity quota-cache reset for retry timing.
       const lockedConns = connections.filter(c => isModelLockActive(c, model));
       const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
@@ -457,6 +527,9 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   let isSuspended = false;
   let permanentOff = false;
   let knownResetAtMs = null;
+  // Persistent ban markers written alongside the suspension state. Kept empty
+  // for non-suspension errors so a normal 429 never bans an account.
+  let banUpdate = {};
 
   // 403 suspension handling — an explicit "until <time>" pins the account off
   // until that moment; a suspension with no usable time is treated as an
@@ -482,6 +555,20 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
       newBackoffLevel = 0;
       log.warn("AUTH", `Account suspended with no expiry, auto-off for 24h [${status}]`);
     }
+
+    // Persistent ban: the authoritative exclusion across restarts. banRetryAt
+    // is the parsed expiry when usable, else now + 7 days. A repeat 403 on an
+    // already-banned account extends the window; bannedAt keeps the first ban.
+    const banRetryAtMs = (suspendUntilMs && suspendUntilMs > Date.now())
+      ? suspendUntilMs
+      : Date.now() + BAN_RETRY_MS;
+    banUpdate = {
+      banned: true,
+      bannedAt: conn?.banned && conn?.bannedAt ? conn.bannedAt : new Date().toISOString(),
+      banReason: (typeof errorText === "string" ? errorText.slice(0, 200) : "Account suspended"),
+      banRetryAt: new Date(banRetryAtMs).toISOString(),
+    };
+    log.warn("AUTH", `Account banned until ${banUpdate.banRetryAt} [${status}]`);
   }
 
   if (!isSuspended) {
@@ -524,6 +611,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
 
   await updateProviderConnection(connectionId, {
     ...lockUpdate,
+    ...banUpdate,
     testStatus: "unavailable",
     lastError: reason,
     errorCode: status,
@@ -568,7 +656,7 @@ export async function clearAccountError(connectionId, currentConnection, model =
   const now = Date.now();
   const allLockKeys = Object.keys(conn).filter(k => k.startsWith("modelLock_"));
 
-  if (!conn.testStatus && !conn.lastError && allLockKeys.length === 0) return;
+  if (!conn.testStatus && !conn.lastError && !conn.banned && allLockKeys.length === 0) return;
 
   // Keys to clear: current model's lock + all expired locks
   const keysToClear = allLockKeys.filter(k => {
@@ -578,7 +666,7 @@ export async function clearAccountError(connectionId, currentConnection, model =
     return expiry && new Date(expiry).getTime() <= now;   // expired
   });
 
-  if (keysToClear.length === 0 && conn.testStatus !== "unavailable" && !conn.lastError) return;
+  if (keysToClear.length === 0 && conn.testStatus !== "unavailable" && !conn.lastError && !conn.banned) return;
 
   // Check if any active locks remain after clearing
   const remainingActiveLocks = allLockKeys.filter(k => {
@@ -588,6 +676,18 @@ export async function clearAccountError(connectionId, currentConnection, model =
   });
 
   const clearObj = Object.fromEntries(keysToClear.map(k => [k, null]));
+
+  // A successful request against a banned account proves the ban is over
+  // (hybrid probe path) — clear the ban markers unconditionally.
+  if (conn.banned) {
+    Object.assign(clearObj, {
+      banned: false,
+      bannedAt: null,
+      banReason: null,
+      banRetryAt: null,
+    });
+    log.info("AUTH", `Account ${connectionId.slice(0, 8)} ban cleared after successful request`);
+  }
 
   // Only reset error state if no active locks remain
   if (remainingActiveLocks.length === 0) {

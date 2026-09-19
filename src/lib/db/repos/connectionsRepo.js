@@ -8,6 +8,8 @@ const OPTIONAL_FIELDS = [
   "scope", "projectId", "apiKey", "testStatus",
   "lastTested", "lastError", "lastErrorAt", "rateLimitedUntil", "expiresIn", "errorCode",
   "consecutiveUseCount", "idToken", "lastRefreshAt", "weight",
+  // Persistent per-account ban markers (stored in the data JSON, no SQL column).
+  "banned", "bannedAt", "banReason", "banRetryAt",
 ];
 
 const MODEL_LOCK_PREFIX = "modelLock_";
@@ -27,6 +29,12 @@ function resetHealthStateOnActivation(existing, patch) {
     // suspension markers alongside the model locks.
     suspendedUntil: null,
     suspendIndefinite: null,
+    // A successful request also clears a persistent ban (the hybrid
+    // probe-after-banRetryAt path relies on this).
+    banned: false,
+    bannedAt: null,
+    banReason: null,
+    banRetryAt: null,
   };
 
   for (const key of Object.keys(existing || {})) {

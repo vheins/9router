@@ -57,6 +57,11 @@ function shouldSkipAfterFailure(state, key, nowMs = Date.now()) {
 }
 
 async function evaluateConnection(conn, deps, state) {
+  // A banned account is excluded from routing by auth.js; auto-toggle must not
+  // re-activate it either. It stays off until manually unbanned or a successful
+  // probe clears the ban.
+  if (conn.banned === true) return;
+
   const key = cacheKey(conn);
   if (shouldSkipAfterFailure(state, key)) return;
 

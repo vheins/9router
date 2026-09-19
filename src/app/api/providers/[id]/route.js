@@ -95,6 +95,7 @@ export async function PUT(request, { params }) {
       globalPriority,
       defaultModel,
       isActive,
+      banned,
       apiKey,
       testStatus,
       lastError,
@@ -124,6 +125,23 @@ export async function PUT(request, { params }) {
     if (globalPriority !== undefined) updateData.globalPriority = globalPriority;
     if (defaultModel !== undefined) updateData.defaultModel = defaultModel;
     if (isActive !== undefined) updateData.isActive = isActive;
+    if (banned !== undefined) {
+      if (banned) {
+        // Manual ban is indefinite until a manual unban (no auto-probe window).
+        updateData.banned = true;
+        updateData.bannedAt = new Date().toISOString();
+        updateData.banReason = typeof body.banReason === "string" && body.banReason.trim()
+          ? body.banReason.trim()
+          : "Manually banned";
+        updateData.banRetryAt = null;
+      } else {
+        // Manual unban clears every ban marker so routing resumes immediately.
+        updateData.banned = false;
+        updateData.bannedAt = null;
+        updateData.banReason = null;
+        updateData.banRetryAt = null;
+      }
+    }
     if (apiKey && existing.authType === "apikey") updateData.apiKey = apiKey;
     if (testStatus !== undefined) updateData.testStatus = testStatus;
     if (lastError !== undefined) updateData.lastError = lastError;
