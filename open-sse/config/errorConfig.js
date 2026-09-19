@@ -38,7 +38,11 @@ export const BACKOFF_CONFIG = {
 // Default cooldown for transient/unknown errors
 export const TRANSIENT_COOLDOWN_MS = 30 * 1000;
 
-// Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h)
+// Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h).
+// NOTE: retained for backward compatibility. Known-reset handling now lives in
+// open-sse/utils/parseRetryAfter.js (clampCooldownMs), which keeps a declared
+// reset window intact instead of truncating it — a 7-day quota must stay off
+// 7 days, so callers should NOT clamp provider reset times with this constant.
 export const MAX_RATE_LIMIT_COOLDOWN_MS = 30 * 60 * 1000;
 
 // Cooldown durations (ms)
@@ -61,6 +65,17 @@ export const ERROR_RULES = [
   { text: "no credentials",           cooldownMs: COOLDOWN.long },
   { text: "request not allowed",      cooldownMs: COOLDOWN.short },
   { text: "improperly formed request", cooldownMs: COOLDOWN.long },
+  // Credit/consumption-rate limits (e.g. Kiro CREDIT_CONSUMPTION_RATE_EXCEEDED)
+  // are account-scoped throttles, not per-request errors — back off so the
+  // fallback chain moves on instead of retrying the same throttled account.
+  { text: "credit consumption rate",  backoff: true },
+  { text: "credit_consumption_rate_exceeded", backoff: true },
+  // Quota/limit exhaustion wording (Google RESOURCE_EXHAUSTED, "quota reached",
+  // "quota exhausted"). These usually carry a reset window which the caller
+  // extracts separately; the rule here is the fallback when none is parseable.
+  { text: "quota reached",            backoff: true },
+  { text: "quota exhausted",          backoff: true },
+  { text: "resource_exhausted",       backoff: true },
   { text: "rate limit",               backoff: true },
   { text: "too many requests",        backoff: true },
   { text: "quota exceeded",           backoff: true },

@@ -4,7 +4,7 @@ import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/con
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { orderTargets, quotaAwareOrder, isSelectionStrategy } from "open-sse/services/routingStrategies.js";
 import { routingStateStore } from "open-sse/services/routingStateStore.js";
-import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
+import { resolveResetAt, parseResetTimeFromMessage, clampCooldownMs } from "open-sse/utils/parseRetryAfter.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
 import * as log from "../utils/logger.js";
@@ -427,15 +427,22 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 
 /**
  * Mark account+model as unavailable — locks modelLock_${model} in DB.
- * All errors (429, 401, 5xx, etc.) lock per model, not per account.
+ *
+ * When the provider states a concrete "usable again at" moment (quota reset,
+ * "resets in ...", Retry-After header, codex resets_at, suspension expiry) the
+ * lock is held until then instead of a short generic cooldown, so the fallback
+ * chain is not wasted re-probing a credential that is guaranteed to fail.
+ *
  * @param {string} connectionId
  * @param {number} status - HTTP status code from upstream
  * @param {string} errorText
  * @param {string|null} provider
  * @param {string|null} model - The specific model that triggered the error
- * @returns {{ shouldFallback: boolean, cooldownMs: number }}
+ * @param {number|null} resetsAtMs - Provider-supplied reset timestamp (epoch ms)
+ * @param {number|string|null} retryAfterMs - Retry-After header value (delta seconds or HTTP-date)
+ * @returns {{ shouldFallback: boolean, cooldownMs: number, resetAtMs: number|null, suspendedUntil: number|null }}
  */
-export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
+export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null, retryAfterMs = null) {
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
   const connections = await getProviderConnections({ provider });
   const conn = connections.find(c => c.id === connectionId);
@@ -449,19 +456,18 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   let suspendUntilMs = null;
   let isSuspended = false;
   let permanentOff = false;
+  let knownResetAtMs = null;
 
   // 403 suspension handling — an explicit "until <time>" pins the account off
   // until that moment; a suspension with no usable time is treated as an
   // indefinite auto-off (long cooldown) instead of a 2-minute retry loop that
   // would keep hammering a clearly-dead credential.
   if (isSuspension403(status, errorText)) {
-    suspendUntilMs = parseSuspendUntil(errorText);
+    suspendUntilMs = parseSuspendUntil(errorText) || parseResetTimeFromMessage(errorText);
     if (suspendUntilMs && suspendUntilMs > Date.now()) {
       isSuspended = true;
-      const cooldownFromSuspend = suspendUntilMs - Date.now();
-      const maxCooldown = 30 * 24 * 60 * 60 * 1000; // 30 days
-      const minCooldown = 60 * 60 * 1000;           // 1 hour
-      cooldownMs = Math.max(minCooldown, Math.min(cooldownFromSuspend, maxCooldown));
+      knownResetAtMs = suspendUntilMs;
+      cooldownMs = clampCooldownMs(suspendUntilMs - Date.now());
       shouldFallback = true;
       newBackoffLevel = 0;
       log.warn("AUTH", `Account suspended until ${new Date(suspendUntilMs).toISOString()}, auto-off for ${Math.round(cooldownMs / 1000 / 60)}m`);
@@ -482,17 +488,25 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     // GitHub premium-request exhaustion is account-wide until the next UTC month.
     const githubResetAtMs = githubMonthlyResetMs(status, errorText, provider);
 
+    // A provider that states WHEN the credential becomes usable again
+    // (quota reset, "resets in 165h26m22s", Retry-After header, codex
+    // resets_at) must be kept off until that moment — retrying earlier is
+    // guaranteed to fail and only burns the fallback chain. This runs before
+    // the generic rules so a precise reset always wins over backoff.
+    knownResetAtMs = resolveResetAt({ errorText, retryAfter: retryAfterMs, resetsAtMs });
+
     if (githubResetAtMs) {
       shouldFallback = true;
       cooldownMs = githubResetAtMs - Date.now();
+      knownResetAtMs = githubResetAtMs;
       newBackoffLevel = 0;
-    } else if (resetsAtMs && resetsAtMs > Date.now()) {
+    } else if (knownResetAtMs && knownResetAtMs > Date.now()) {
       shouldFallback = true;
-      // Antigravity quota API provides exact per-model resetAt. Do not truncate it.
-      cooldownMs = resolveProviderId(provider) === "antigravity"
-        ? resetsAtMs - Date.now()
-        : Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
+      // Keep the provider's exact reset window; never truncate a known reset
+      // (a 7-day Antigravity quota must stay off 7 days, not 30 minutes).
+      cooldownMs = clampCooldownMs(knownResetAtMs - Date.now());
       newBackoffLevel = 0;
+      log.warn("AUTH", `Known reset at ${new Date(knownResetAtMs).toISOString()}, holding off for ${Math.round(cooldownMs / 1000)}s [${status}]`);
     } else {
       ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel));
     }
@@ -502,8 +516,10 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   const reason = typeof errorText === "string" ? errorText.slice(0, 200) : "Provider error";
   // Suspensions lock the WHOLE account (model=null → modelLock___all) because a
   // suspended credential is unusable for every model, not just the one that hit
-  // it. Other errors keep the per-model lock.
-  const lockModel = isSuspended ? null : (githubMonthlyResetMs(status, errorText, provider) ? null : model);
+  // it. A known account-wide reset (monthly/quota) does the same. Other errors
+  // keep the per-model lock.
+  const accountWide = isSuspended || Boolean(githubMonthlyResetMs(status, errorText, provider));
+  const lockModel = accountWide ? null : model;
   const lockUpdate = buildModelLockUpdate(lockModel, cooldownMs);
 
   await updateProviderConnection(connectionId, {
@@ -513,8 +529,11 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     errorCode: status,
     lastErrorAt: new Date().toISOString(),
     backoffLevel: newBackoffLevel ?? backoffLevel,
-    // Persist suspend info for routing accuracy (null clears it on normal errors).
-    suspendedUntil: isSuspended ? new Date(Date.now() + cooldownMs).toISOString() : null,
+    // Persist the "usable again at" moment for routing accuracy. A known reset
+    // is authoritative; a suspension without one records its 24h self-heal.
+    suspendedUntil: (isSuspended || knownResetAtMs)
+      ? new Date(isSuspended ? Date.now() + cooldownMs : knownResetAtMs).toISOString()
+      : null,
     suspendIndefinite: permanentOff ? true : null
   });
 
@@ -526,7 +545,12 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     console.error(`❌ ${provider} [${status}]: ${reason}`);
   }
 
-  return { shouldFallback: true, cooldownMs, suspendedUntil: isSuspended ? Date.now() + cooldownMs : null };
+  return {
+    shouldFallback: true,
+    cooldownMs,
+    suspendedUntil: isSuspended ? Date.now() + cooldownMs : null,
+    resetAtMs: knownResetAtMs || null,
+  };
 }
 
 /**

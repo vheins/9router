@@ -337,22 +337,29 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     if (result.success) return result.response;
 
-    // Antigravity 409/429: refresh live quota to get exact resetAt before locking
+    // Antigravity 409/429: refresh live quota to get exact resetAt before locking.
+    // The upstream error text is passed through so a declared reset window
+    // ("Resets in 165h26m22s") is honored even when the quota API is aborted.
     let quotaResetMs = null;
     let resetsAtMs = result.resetsAtMs;
     if (provider === "antigravity" && (result.status === 409 || result.status === 429)) {
       quotaResetMs = await handleAntigravityQuotaError(
         credentials.connectionId, result.status, model,
-        refreshedCredentials.accessToken, credentials.providerSpecificData
+        refreshedCredentials.accessToken, credentials.providerSpecificData,
+        result.error
       );
       if (quotaResetMs) resetsAtMs = quotaResetMs;
     }
+
+    // A provider-declared reset (message or Retry-After header) also counts as
+    // a known resetAt, so the lock is held until the credential is usable again.
+    const retryAfterHeader = result.response?.headers?.get?.("retry-after") ?? result.retryAfter ?? null;
 
     // Exhausted Antigravity model is blocked only in RAM cache until upstream resetAt.
     // Do not persist a modelLock_* for this path.
     const shouldFallback = provider === "antigravity" && quotaResetMs
       ? true
-      : (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs)).shouldFallback;
+      : (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs, retryAfterHeader)).shouldFallback;
 
     if (shouldFallback) {
       log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} UNAVAILABLE (${result.status}) → NEXT ACCOUNT`);

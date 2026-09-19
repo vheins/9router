@@ -164,3 +164,74 @@ describe("403 suspension auto-off", () => {
     }
   });
 });
+
+describe("known-reset 429 handling", () => {
+  it("holds the model off until a message-declared reset (Google 165h)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-19T10:00:00.000Z"));
+    try {
+      const result = await markAccountUnavailable(
+        "kiro-a",
+        429,
+        "Individual quota reached. Resets in 165h26m22s.",
+        "antigravity",
+        "gemini-3.8-flash-high",
+      );
+
+      const expectedReset = Date.now() + (165 * 3600 + 26 * 60 + 22) * 1000;
+      // Not the 5-minute generic backoff — the exact declared window.
+      expect(result.cooldownMs).toBe(165 * 3600 * 1000 + 26 * 60 * 1000 + 22 * 1000);
+      expect(result.resetAtMs).toBe(expectedReset);
+      expect(dbMocks.updateProviderConnection).toHaveBeenCalledWith(
+        "kiro-a",
+        expect.objectContaining({
+          "modelLock_gemini-3.8-flash-high": new Date(expectedReset).toISOString(),
+          suspendedUntil: new Date(expectedReset).toISOString(),
+        }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("honours a Retry-After header when the message has no reset", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-19T10:00:00.000Z"));
+    try {
+      const result = await markAccountUnavailable(
+        "kiro-a",
+        429,
+        "Too many requests, please wait before trying again.",
+        "kiro",
+        "auto",
+        null,
+        "600",
+      );
+
+      expect(result.cooldownMs).toBe(600_000);
+      expect(result.resetAtMs).toBe(Date.now() + 600_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back to generic backoff when no reset is declared", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-19T10:00:00.000Z"));
+    try {
+      const result = await markAccountUnavailable(
+        "kiro-a",
+        429,
+        "Too many requests, please wait before trying again.",
+        "kiro",
+        "auto",
+      );
+
+      // No declared reset → exponential backoff, not a 24h/7d window.
+      expect(result.resetAtMs).toBeNull();
+      expect(result.cooldownMs).toBeLessThanOrEqual(5 * 60 * 1000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

@@ -7,6 +7,7 @@
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { getAntigravityUsage } from "open-sse/services/usage/google.js";
 import { persistQuotaSnapshot } from "@/shared/quota/persistQuota.js";
+import { parseResetTimeFromMessage } from "open-sse/utils/parseRetryAfter.js";
 import * as log from "../utils/logger.js";
 
 // In-memory cache: connectionId → { [modelId]: { remainingPercentage, resetAt } }
@@ -138,14 +139,27 @@ async function _doRefresh(connectionId, accessToken, providerSpecificData, now) 
 /**
  * Handle Antigravity 409/429 — refresh RAM cache and return model resetAt when exhausted.
  * Called from chat handler error path.
+ * @param {string} connectionId
+ * @param {number} status
+ * @param {string} model
+ * @param {string} accessToken
+ * @param {object} providerSpecificData
+ * @param {string|null} [errorText] - Upstream error message; parsed for a reset
+ *   time when the quota API is unavailable (e.g. aborted) so a known 7-day
+ *   quota is not downgraded to a 15-minute strike block.
  * @returns {number|null} resetAt timestamp ms (for resetsAtMs passthrough) or null
  */
-export async function handleAntigravityQuotaError(connectionId, status, model, accessToken, providerSpecificData) {
+export async function handleAntigravityQuotaError(connectionId, status, model, accessToken, providerSpecificData, errorText = null) {
   log.info("AG_QUOTA", `${connectionId.slice(0, 8)} | ${status} on ${model} — refreshing quota`);
 
   // Throttle applies to error paths too: one quota request per account/30s.
   // The first 409/429 populates cache; concurrent or repeated errors reuse it.
   const quota = (await refreshAntigravityQuota(connectionId, accessToken, providerSpecificData))?.[model];
+
+  // The quota API can be unreachable/aborted (network, DNS, 403). When it is,
+  // fall back to the reset time embedded in the upstream error message so a
+  // provider-declared window ("Resets in 165h26m22s") is still honored.
+  const messageResetAt = quota ? null : parseResetTimeFromMessage(errorText);
 
   // Strike breaker: count every 429 whose quota reading is either optimistic
   // (remaining > 0) or unavailable (quota API 403/error). 3 within the window
@@ -155,6 +169,18 @@ export async function handleAntigravityQuotaError(connectionId, status, model, a
   // retry" was motivated by 409/429 pairs), and poisoning by transient 409s
   // requires 3 of them inside 60 seconds on the same pair.
   if (!quota || quota.remainingPercentage > 0) {
+    // A provider-declared reset beats the strike heuristic: if upstream says
+    // "available again in 7 days", block until then rather than 15 minutes.
+    if (messageResetAt && messageResetAt > Date.now()) {
+      strikeCounts.delete(`${connectionId}|${model}`);
+      const cached = quotaCache.get(connectionId) || {};
+      cached[model] = { remainingPercentage: 0, resetAt: new Date(messageResetAt).toISOString() };
+      quotaCache.set(connectionId, cached);
+      strikeBlocks.set(`${connectionId}|${model}`, messageResetAt);
+      log.warn("AG_QUOTA", `${connectionId.slice(0, 8)} | MESSAGE_${status} ${model} — quota reset declared; CACHE_BLOCK until ${new Date(messageResetAt).toISOString()}`);
+      return messageResetAt;
+    }
+
     const key = `${connectionId}|${model}`;
     const now = Date.now();
     const strike = strikeCounts.get(key);
