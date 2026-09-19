@@ -33,6 +33,10 @@ vi.mock("@/lib/localDb", () => ({
 }));
 vi.mock("@/lib/usageDb.js", () => ({
   getConnectionActiveCount: vi.fn(() => 0),
+  // auth.js connectionsToTargets() reads the scheduler-warmed 24h metrics cache.
+  // The real getConnectionMetrics24hCached() returns an empty map until the
+  // first refresh, so the scorer degrades to neutral defaults.
+  getConnectionMetrics24hCached: vi.fn(() => ({})),
 }));
 vi.mock("@/lib/network/connectionProxy", () => ({
   resolveConnectionProxyConfig: vi.fn(async () => ({})),

@@ -303,13 +303,17 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     });
 
     if (availableConnections.length === 0) {
-      // A persistent ban is the authoritative exclusion — surface it (and its
-      // retry timing) before falling back to lock/quota reporting so callers
-      // can say "banned" rather than the generic "unavailable". Only
-      // non-excluded accounts count: an already-tried banned account must not
-      // mask the real reason the remaining accounts are unavailable.
-      const activeBans = connections.filter(c => !excludeSet.has(c.id) && isBanActive(c));
-      if (activeBans.length > 0) {
+      // Ban vs lock classification is over NON-excluded connections only: an
+      // already-tried banned account must not mask the real reason the remaining
+      // accounts are unavailable.
+      const remainingConns = connections.filter(c => !excludeSet.has(c.id));
+      const activeBans = remainingConns.filter(c => isBanActive(c));
+
+      // A persistent ban is authoritative ONLY when every remaining account is
+      // banned. When banned and model-locked accounts coexist, the earliest
+      // recovery across both sets wins so a short 429 lock is not masked by an
+      // indefinite ban.
+      if (activeBans.length > 0 && activeBans.length === remainingConns.length) {
         const banExpiries = activeBans
           .map(c => c.banRetryAt)
           .filter(v => v && Number.isFinite(new Date(v).getTime()))
@@ -336,9 +340,14 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
           if (resetAt && new Date(resetAt).getTime() > Date.now()) expiries.push(resetAt);
         });
       }
+      // A ban with a known retry time is a recovery candidate too; a manual ban
+      // (no banRetryAt) offers none and stays out of the earliest calculation.
+      for (const c of activeBans) {
+        if (c.banRetryAt && Number.isFinite(new Date(c.banRetryAt).getTime())) expiries.push(c.banRetryAt);
+      }
       const earliest = expiries.sort()[0] || null;
       if (earliest) {
-        const earliestConn = lockedConns[0];
+        const earliestConn = lockedConns[0] || activeBans[0];
         log.warn("AUTH", `${provider} | all ${connections.length} accounts locked for ${model || "all"} (${formatRetryAfter(earliest)}) | lastError=${earliestConn?.lastError?.slice(0, 50)}`);
         return {
           allRateLimited: true,

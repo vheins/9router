@@ -219,6 +219,19 @@ describe("quota auto-toggle", () => {
     expect(deps.updateProviderConnection).toHaveBeenCalledWith("c1", { isActive: true });
   });
 
+  it("skips a banned connection whose persisted flag is truthy (1), not literal true", async () => {
+    deps.getSettings.mockResolvedValue({ quotaAutoToggleEnabled: true });
+    deps.getProviderConnections.mockResolvedValue([
+      { id: "c1", provider: "claude", authType: "oauth", isActive: false, banned: 1 },
+    ]);
+    deps.getUsageForProvider.mockResolvedValue(CLAUDE(10, 100));
+
+    await runQuotaAutoToggleTick(deps, state);
+
+    expect(deps.getUsageForProvider).not.toHaveBeenCalled();
+    expect(deps.updateProviderConnection).not.toHaveBeenCalled();
+  });
+
   it("leaves an unknown connection untouched", async () => {
     deps.getSettings.mockResolvedValue({ quotaAutoToggleEnabled: true });
     deps.getProviderConnections.mockResolvedValue([

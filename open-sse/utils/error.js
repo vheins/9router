@@ -114,16 +114,22 @@ export function createErrorResult(statusCode, message, resetsAtMs) {
  * @returns {Response}
  */
 export function unavailableResponse(statusCode, message, retryAfter, retryAfterHuman) {
-  const retryAfterSec = Math.max(Math.ceil((new Date(retryAfter).getTime() - Date.now()) / 1000), 1);
+  // Only advertise a retry window when retryAfter is a usable future timestamp.
+  // `new Date(null).getTime()` is 0 (Unix epoch), which the old clamp turned into
+  // `Retry-After: 1` — a 1-second tight retry loop for an account that requires
+  // manual unban. Null/undefined/past values now omit the header entirely.
+  const retryAtMs = retryAfter ? new Date(retryAfter).getTime() : NaN;
+  const retryAfterSec = Number.isFinite(retryAtMs) && retryAtMs > Date.now()
+    ? Math.max(Math.ceil((retryAtMs - Date.now()) / 1000), 1)
+    : null;
+  const headers = { "Content-Type": "application/json" };
+  if (retryAfterSec !== null) headers["Retry-After"] = String(retryAfterSec);
   const msg = `${message} (${retryAfterHuman})`;
   return new Response(
     JSON.stringify({ error: { message: msg } }),
     {
       status: statusCode,
-      headers: {
-        "Content-Type": "application/json",
-        "Retry-After": String(retryAfterSec)
-      }
+      headers
     }
   );
 }

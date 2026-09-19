@@ -29,12 +29,13 @@ function resetHealthStateOnActivation(existing, patch) {
     // suspension markers alongside the model locks.
     suspendedUntil: null,
     suspendIndefinite: null,
-    // A successful request also clears a persistent ban (the hybrid
-    // probe-after-banRetryAt path relies on this).
-    banned: false,
-    bannedAt: null,
-    banReason: null,
-    banRetryAt: null,
+    // Persistent ban markers (banned/bannedAt/banReason/banRetryAt) are
+    // deliberately NOT cleared here. This hook fires for every health check,
+    // model-endpoint test and token refresh that passes testStatus:"active",
+    // so clearing them would silently unban a suspended account. Ban clearing
+    // is explicit: a successful probe clears it via clearAccountError(), and a
+    // manual unban passes the four fields directly. An explicit patch.banned is
+    // preserved by the spread above.
   };
 
   for (const key of Object.keys(existing || {})) {
